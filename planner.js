@@ -1,4 +1,4 @@
-/* My Money 0.2: pure calculations; never writes user data. All money in kopecks. */
+/* My Money 0.3: pure calculations; never writes user data. All money in kopecks. */
 (function(root){
 'use strict';
 const cents=n=>Math.round((Number(n)||0)*100), rub=n=>n/100;
@@ -80,5 +80,25 @@ function allocation(state,from){
  const mandatoryFunded=take(mandatory),livingFunded=take(living),futureFunded=take(futureReserve),savingsFunded=take(savings);
  return {funds:rub(funds),alreadyReserved:f.initialCash-f.initialFree,mandatoryRequired:rub(mandatory),mandatoryUncovered:rub(mandatory-cents(mandatoryFunded)),livingRequired:rub(living),livingUncovered:rub(living-cents(livingFunded)),mandatory:mandatoryFunded,living:livingFunded,futureReserve:futureFunded,savings:savingsFunded,unallocated:rub(left),desired:rub(desired),shortfall:rub(Math.max(0,-cents(f.minimum),needs-funds)),savingsGap:rub(Math.max(0,desired-savings)),next,forecast:f};
 }
-const api={forecast,allocation,paydays,occurrences,add,categories,budgetConfig,budgetSummary};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyPlanner=api;
+// Only explicitly marked grocery deliveries are counted; merchant names are not evidence.
+function deliveryHistory(state,from){
+ const orders=state.transactions.filter(t=>t.type==='expense'&&t.category==='Продукты'&&t.channel==='delivery'&&t.date<=from);
+ const window=days=>{const rows=orders.filter(t=>t.date>=add(from,1-days));return {count:rows.length,total:rub(rows.reduce((n,t)=>n+cents(t.amount),0))}};
+ return {days7:window(7),days30:window(30),emptyHistory:!state.transactions.some(t=>t.date<=from)};
+}
+function purchaseContext(state,from,input){
+ const urgency=['need','canwait','impulse'].includes(input.urgency)?input.urgency:'canwait';
+ const recommendations=[];
+ if(urgency==='impulse')recommendations.push('Это импульсивная покупка: сделай паузу 48 часов перед решением.');
+ if(input.delivery==='yes'&&input.category==='Продукты'&&urgency!=='need')recommendations.push('Перед необязательной доставкой проверь, есть ли дома продукты. Можно отложить заказ или объединить несколько покупок в один заказ.');
+ if(urgency==='need')recommendations.push('Покупка отмечена как необходимая. Ниже показаны её финансовые последствия; решение остаётся за тобой, автоматического запрета нет.');
+ else if(urgency==='canwait')recommendations.push('Покупку можно отложить: сравни её стоимость с доступной суммой и оставшимся бюджетом.');
+ const config=budgetConfig(state.settings,input.category),item={category:input.category,merchant:input.merchant||''};
+ const configured=Object.hasOwn(state.settings.categoryBudgets||{},input.category)||config.limit>0;
+ const applicable=configured&&(!config.legacyTaxi||taxi(item)),budgetScope={...config,taxiOnly:config.legacyTaxi};
+ const actual=state.transactions.filter(t=>t.type==='expense'&&t.date<=from&&t.date.slice(0,7)===from.slice(0,7)&&matches(t,budgetScope)).reduce((n,t)=>n+cents(t.amount),0);
+ const after=actual+nonnegative(input.amount),over=applicable?Math.max(0,after-config.limit):0;
+ return {urgency,recommendations,deliveries:deliveryHistory(state,from),budget:{configured:applicable,taxiOnly:config.legacyTaxi,limit:rub(config.limit),actual:rub(actual),after:rub(after),overage:rub(over),additionalOverage:rub(Math.max(0,over-Math.max(0,actual-config.limit)))}};
+}
+const api={forecast,allocation,paydays,occurrences,add,categories,budgetConfig,budgetSummary,deliveryHistory,purchaseContext};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyPlanner=api;
 })(globalThis);

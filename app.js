@@ -1,4 +1,4 @@
-/* My Money v0.2 — полностью локальное хранение, без внешних запросов */
+/* My Money v0.3 — полностью локальное хранение, без внешних запросов */
 'use strict';
 const STORAGE_KEY='my-money-finances-v1';
 const CATEGORIES=MoneyPlanner.categories;
