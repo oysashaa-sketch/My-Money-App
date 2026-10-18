@@ -10,7 +10,25 @@ function paydays(from,to){const d=date(from),out=[];for(let m=-1;m<=4;m++){for(c
 function effect(t){return t.type==='income'?cents(t.amount):t.type==='debt_payment'||t.type==='expense'&&t.method==='cash'?-cents(t.amount):0}
 function reserve(t){return t.type==='reserve'?cents(t.amount):t.type==='release'?-cents(t.amount):0}
 function taxi(t){return t.category==='Транспорт'&&(t.channel==='taxi'||/такси|яндекс go|yandex go/i.test(t.merchant||''))}
-function bucket(t){return t.category==='Продукты'?'foodLimit':taxi(t)?'taxiLimit':null}
+const categories=['Жильё','Продукты','Кафе и рестораны','Транспорт','Здоровье','Спорт','Красота','Одежда и обувь','Дом и быт','Подписки и связь','Образование','Подарки','Развлечения','Путешествия','Другое'];
+const nonnegative=n=>Math.max(0,cents(n));
+function budgetConfig(settings,category){
+ const explicit=Object.hasOwn(settings.categoryBudgets||{},category);
+ const legacyTaxi=category==='Транспорт'&&!explicit;
+ const limit=explicit?settings.categoryBudgets[category]:category==='Продукты'?settings.foodLimit:legacyTaxi?settings.taxiLimit:0;
+ const custom=Object.hasOwn(settings.categoryForecasts||{},category);
+ return {category,limit:nonnegative(limit),estimate:nonnegative(custom?settings.categoryForecasts[category]:limit),conservative:!custom,legacyTaxi,taxiOnly:legacyTaxi&&!custom};
+}
+function matches(item,config){return item.category===config.category&&(!config.taxiOnly||taxi(item))}
+function budgetSummary(state,month,asOf){
+ return categories.map(category=>{
+  const c=budgetConfig(state.settings,category);
+  const purchases=state.transactions.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&(!asOf||t.date<=asOf)&&t.category===category);
+  const actual=purchases.reduce((n,t)=>n+cents(t.amount),0),limit=c.legacyTaxi?0:c.limit;
+  const taxiActual=purchases.filter(taxi).reduce((n,t)=>n+cents(t.amount),0);
+  return {...c,limit:rub(limit),estimate:rub(c.estimate),actual:rub(actual),remaining:rub(limit-actual),percent:limit>0?actual/limit*100:null,legacyTaxiBudget:c.legacyTaxi?{limit:rub(c.limit),actual:rub(taxiActual),remaining:rub(c.limit-taxiActual),percent:c.limit>0?taxiActual/c.limit*100:null}:null};
+ });
+}
 function occurrences(state,to){
  const paid=new Set(state.transactions.filter(t=>t.obligationId&&t.forDue).map(t=>`${t.obligationId}|${t.forDue}`)),out=[];
  for(const o of state.obligations){if(!/^\d{4}-\d{2}-\d{2}$/.test(o.firstDue||''))continue;
@@ -23,8 +41,8 @@ function forecast(state,from,days=60,purchase=0){
  const to=add(from,days-1),s=state.settings,tx=state.transactions;
  let cash=cents(s.startingBalance)+tx.filter(t=>t.date<=from).reduce((a,t)=>a+effect(t),0),saved=tx.filter(t=>t.date<=from).reduce((a,t)=>a+reserve(t),0);
  cash-=cents(purchase);
- const initialCash=cash,initialFree=cash-saved,events=[],obs=occurrences(state,to);
- for(const o of obs)events.push({date:o.due<from?from:o.due,name:o.name+(o.due<from?' (просрочено)':''),kind:'obligation',delta:-cents(o.amount),reserveDelta:0,order:0});
+ const initialCash=cash,initialFree=cash-saved,events=[],endDate=date(to),monthEnd=iso(new Date(endDate.getFullYear(),endDate.getMonth()+1,0,12)),obs=occurrences(state,monthEnd);
+ for(const o of obs.filter(o=>o.due<=to))events.push({date:o.due<from?from:o.due,name:o.name+(o.due<from?' (просрочено)':''),kind:'obligation',delta:-cents(o.amount),reserveDelta:0,order:0});
  for(const t of tx.filter(t=>t.date>from&&t.date<=to))if(effect(t)||reserve(t))events.push({date:t.date,name:t.note||'Внесённая будущая операция',kind:'recorded',delta:effect(t),reserveDelta:reserve(t),order:effect(t)>0?3:1});
  // A manually scheduled income replaces the estimated salary on that date.
  for(const p of paydays(from,to))if(!tx.some(t=>t.type==='income'&&t.date===p))events.push({date:p,name:'Ожидаемая зарплата (только прогноз)',kind:'salary',delta:Number(p.slice(8))<=5?Math.floor(cents(s.salary)/2):cents(s.salary)-Math.floor(cents(s.salary)/2),reserveDelta:0,order:4});
@@ -33,22 +51,23 @@ function forecast(state,from,days=60,purchase=0){
   const month=day.slice(0,7);if(!monthly.has(month)){
    const start=month===from.slice(0,7)?from:month+'-01',d=date(day),last=iso(new Date(d.getFullYear(),d.getMonth()+1,0,12)),count=Math.round((date(last)-date(start))/86400000)+1;
    let total=0;
-   for(const key of ['foodLimit','taxiLimit']){
-    const spent=tx.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&bucket(t)===key).reduce((a,t)=>a+cents(t.amount),0);
-    const planned=obs.filter(o=>o.type!=='debt'&&o.due.slice(0,7)===month&&bucket(o)===key).reduce((a,o)=>a+cents(o.amount),0);
-    total+=Math.max(0,cents(s[key])-spent-planned);
+   for(const category of categories){
+    const config=budgetConfig(s,category);
+    const spent=tx.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&matches(t,config)).reduce((a,t)=>a+cents(t.amount),0);
+    const planned=obs.filter(o=>o.type!=='debt'&&o.due.slice(0,7)===month&&matches(o,config)).reduce((a,o)=>a+cents(o.amount),0);
+    total+=Math.max(0,config.estimate-spent-planned);
    }
    total+=cents(s.otherDaily)*count;
    monthly.set(month,{total,count,index:0});
   }
   const pool=monthly.get(month),n=pool.index++,daily=Math.floor(pool.total*(n+1)/pool.count)-Math.floor(pool.total*n/pool.count);
-  if(daily)events.push({date:day,name:'Продукты, такси и другие траты на жизнь',kind:'living',delta:-daily,reserveDelta:0,order:2});
+  if(daily)events.push({date:day,name:'Расходы по бюджетам категорий и дневной настройке',kind:'living',delta:-daily,reserveDelta:0,order:2});
  }
  events.sort((a,b)=>a.date.localeCompare(b.date)||a.order-b.order);
- let minimum=initialFree,minDate=from;
- for(const e of events){cash+=e.delta;saved+=e.reserveDelta;e.cash=rub(cash);e.free=rub(cash-saved);e.amount=rub(e.delta);if(cash-saved<minimum){minimum=cash-saved;minDate=e.date}}
+ let minimum=initialFree,minDate=from,firstDeficitDate=initialFree<0?from:null;
+ for(const e of events){cash+=e.delta;saved+=e.reserveDelta;e.cash=rub(cash);e.free=rub(cash-saved);e.amount=rub(e.delta);if(cash-saved<0&&!firstDeficitDate)firstDeficitDate=e.date;if(cash-saved<minimum){minimum=cash-saved;minDate=e.date}}
  const target=Math.max(0,cents(s.savingsTarget)-tx.filter(t=>t.date<=from&&t.date.slice(0,7)===from.slice(0,7)).reduce((a,t)=>a+reserve(t),0));
- return {from,to,events,initialCash:rub(initialCash),initialFree:rub(initialFree),minimum:rub(minimum),minDate,end:rub(cash-saved),savingsRemaining:rub(target),available:rub(Math.max(0,minimum-target)),missingBasics:!(Number(s.foodLimit)>0)||!(Number(s.taxiLimit)>0)};
+ return {from,to,events,firstDeficitDate,maxDeficitDate:minimum<0?minDate:null,conservative:categories.some(c=>{const b=budgetConfig(s,c);return b.conservative&&b.estimate>0}),initialCash:rub(initialCash),initialFree:rub(initialFree),minimum:rub(minimum),minDate,end:rub(cash-saved),savingsRemaining:rub(target),available:rub(Math.max(0,minimum-target)),missingBasics:categories.some(c=>budgetConfig(s,c).estimate===0)};
 }
 function allocation(state,from){
  const f=forecast(state,from),next=paydays(from,add(from,40))[0];
@@ -58,7 +77,8 @@ function allocation(state,from){
  const futureReserve=Math.max(0,funds-needs-headroom),desired=cents(f.savingsRemaining);
  const savings=Math.min(desired,headroom,Math.max(0,funds-needs-futureReserve));
  let left=funds;const take=n=>{const v=Math.min(left,n);left-=v;return rub(v)};
- return {funds:rub(funds),mandatory:take(mandatory),living:take(living),futureReserve:take(futureReserve),savings:take(savings),unallocated:rub(left),desired:rub(desired),shortfall:rub(Math.max(0,-cents(f.minimum),needs-funds)),savingsGap:rub(Math.max(0,desired-savings)),next,forecast:f};
+ const mandatoryFunded=take(mandatory),livingFunded=take(living),futureFunded=take(futureReserve),savingsFunded=take(savings);
+ return {funds:rub(funds),alreadyReserved:f.initialCash-f.initialFree,mandatoryRequired:rub(mandatory),mandatoryUncovered:rub(mandatory-cents(mandatoryFunded)),livingRequired:rub(living),livingUncovered:rub(living-cents(livingFunded)),mandatory:mandatoryFunded,living:livingFunded,futureReserve:futureFunded,savings:savingsFunded,unallocated:rub(left),desired:rub(desired),shortfall:rub(Math.max(0,-cents(f.minimum),needs-funds)),savingsGap:rub(Math.max(0,desired-savings)),next,forecast:f};
 }
-const api={forecast,allocation,paydays,occurrences,add};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyPlanner=api;
+const api={forecast,allocation,paydays,occurrences,add,categories,budgetConfig,budgetSummary};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyPlanner=api;
 })(globalThis);
