@@ -1,0 +1,169 @@
+const {test}=require('node:test');
+const assert=require('node:assert/strict');
+const fs=require('node:fs');
+const vm=require('node:vm');
+const path=require('node:path');
+const P=require('../planner.js');
+const fixture=()=>({version:1,settings:{startingBalance:1000,salary:2000,savingsTarget:0,foodLimit:0,taxiLimit:0},transactions:[],goals:[],wishes:[],debts:[],obligations:[]});
+const bill=(due,amount=100,frequency='once',extra={})=>({id:'o',name:'Synthetic bill',amount,firstDue:due,frequency,type:'bill',...extra});
+test('salary weekends, years and leap dates',()=>{assert.deepEqual(P.paydays('2026-12-31','2027-01-31'),['2027-01-05','2027-01-20']);assert.deepEqual(P.paydays('2026-09-01','2026-09-30'),['2026-09-04','2026-09-18']);assert.equal(P.add('2028-02-28',1),'2028-02-29')});
+test('30/60 days do not mutate v1 data or credit actual cash with expected salary',()=>{const s=fixture(),original=JSON.stringify(s);const a=P.forecast(s,'2026-09-01',30),b=P.forecast(s,'2026-09-01',60);assert.equal(a.initialCash,1000);assert.equal(a.events.filter(e=>e.kind==='salary').length,2);assert.equal(b.events.filter(e=>e.kind==='salary').length,4);assert.equal(JSON.stringify(s),original);assert.equal(a.to,'2026-09-30');assert.equal(b.to,'2026-10-30')});
+test('same-day bill runs before salary and detects cash shortage',()=>{const s=fixture();s.settings.startingBalance=50;s.obligations=[bill('2026-09-04',100)];const f=P.forecast(s,'2026-09-01');assert.equal(f.minimum,-50);assert.equal(f.minDate,'2026-09-04');assert.equal(f.events.find(e=>e.kind==='obligation').cash,-50)});
+test('bill immediately after salary protects funds now',()=>{const s=fixture();s.settings.startingBalance=500;s.obligations=[bill('2026-09-05',1400)];const f=P.forecast(s,'2026-09-01');assert.equal(f.minimum,100);assert.equal(f.available,100);const a=P.allocation(s,'2026-09-01');assert.equal(a.futureReserve,400);assert.equal(a.unallocated,100)});
+test('weekly, biweekly, monthly clamping, bimonthly and count',()=>{const s=fixture();s.obligations=[bill('2026-08-31',1,'monthly',{count:3})];assert.deepEqual(P.occurrences(s,'2026-11-30').map(o=>o.due),['2026-08-31','2026-09-30','2026-10-31']);for(const [freq,n]of [['weekly',5],['biweekly',3],['bimonthly',1]]){s.obligations=[bill('2026-09-01',1,freq)];assert.equal(P.occurrences(s,'2026-09-30').length,n)}});
+test('old overdue payments are not dropped after 45 days or 1000 occurrences',()=>{const s=fixture();s.obligations=[bill('2020-01-01',1,'weekly')];assert.ok(P.forecast(s,'2026-09-01').events.some(e=>e.name.includes('просрочено')));s.obligations=[bill('1900-01-01',1,'monthly')];assert.ok(P.occurrences(s,'2026-09-01').length>1000)});
+test('paid debt purchase never debits card twice; paid occurrence excluded',()=>{const s=fixture();s.obligations=[bill('2026-09-01',100,'once',{type:'debt'})];s.transactions=[{type:'expense',method:'debt',category:'Одежда',amount:300,date:'2026-08-31'},{type:'debt_payment',amount:100,date:'2026-09-01',obligationId:'o',forDue:'2026-09-01'}];const f=P.forecast(s,'2026-09-01');assert.equal(f.initialCash,900);assert.equal(f.events.filter(e=>e.kind==='obligation').length,0);assert.equal(f.minimum,900)});
+test('future recorded payment counted once and income replaces salary estimate',()=>{const s=fixture();s.obligations=[bill('2026-09-04',100)];s.transactions=[{type:'debt_payment',date:'2026-09-04',amount:100,obligationId:'o',forDue:'2026-09-04'},{type:'income',date:'2026-09-04',amount:800}];const f=P.forecast(s,'2026-09-01');assert.equal(f.events.filter(e=>e.date==='2026-09-04'&&e.kind==='salary').length,0);assert.equal(f.events.filter(e=>e.date==='2026-09-04').at(-1).cash,1700)});
+test('food/taxi budget excludes existing purchases and known food bills, never debt repayment',()=>{const s=fixture();s.settings.salary=0;s.settings.foodLimit=300;s.settings.taxiLimit=90;s.settings.otherDaily=1;s.transactions=[{type:'expense',method:'debt',category:'Продукты',date:'2026-09-01',amount:100}];s.obligations=[bill('2026-09-02',50,'once',{category:'Продукты'}),bill('2026-09-03',20,'once',{id:'d',type:'debt',category:'Продукты'})];const f=P.forecast(s,'2026-09-01',30);assert.equal(f.events.filter(e=>e.kind==='living').reduce((a,e)=>a+Math.round(-e.amount*100),0),27000);assert.equal(f.end,660)});
+test('remaining monthly budget spread across actual remaining days; fractional cents stable',()=>{const s=fixture();s.settings.salary=0;s.settings.foodLimit=100;s.transactions=[{type:'expense',method:'cash',amount:40,category:'Продукты',date:'2026-09-01'}];const f=P.forecast(s,'2026-09-29',2);assert.equal(f.events.filter(e=>e.kind==='living').reduce((a,e)=>a+e.amount,0),-60);assert.equal(f.end,900)});
+test('reserved savings and monthly target protected; releases restore target',()=>{const s=fixture();s.settings.salary=0;s.settings.savingsTarget=200;s.transactions=[{type:'reserve',amount:100,date:'2026-09-01'}];let f=P.forecast(s,'2026-09-01');assert.equal(f.initialCash,1000);assert.equal(f.initialFree,900);assert.equal(f.available,800);assert.equal(f.savingsRemaining,100);s.transactions.push({type:'release',amount:50,date:'2026-09-01'});assert.equal(P.forecast(s,'2026-09-01').savingsRemaining,150)});
+test('allocation is nonnegative, bounded by actual funds and reduces savings when underfunded',()=>{const s=fixture();s.settings.startingBalance=50;s.settings.savingsTarget=100;s.obligations=[bill('2026-09-02',100)];const a=P.allocation(s,'2026-09-01');assert.equal(a.shortfall,50);assert.equal(a.savings,0);for(const k of ['mandatory','living','futureReserve','savings','unallocated'])assert.ok(a[k]>=0);assert.equal(a.mandatory+a.living+a.futureReserve+a.savings+a.unallocated,a.funds)});
+test('purchase detects future shortage and never changes history',()=>{const s=fixture();s.obligations=[bill('2026-09-05',1900)];const before=JSON.stringify(s);assert.equal(P.forecast(s,'2026-09-01').minimum,100);assert.equal(P.forecast(s,'2026-09-01',60,101).minimum,-1);assert.equal(JSON.stringify(s),before)});
+test('v1 application load and planner views leave localStorage byte-identical',()=>{const s=fixture(),raw=JSON.stringify(s);let writes=0;const elements=new Map();const element=id=>{if(!elements.has(id))elements.set(id,{innerHTML:'',textContent:'',dataset:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},showModal(){},close(){}});return elements.get(id)};const ctx=vm.createContext({structuredClone,console,Date,Math,Set,Map,JSON,Number,String,localStorage:{getItem:()=>raw,setItem(){writes++}},document:{getElementById:element,querySelectorAll:()=>[],addEventListener(){}},navigator:{},location:{protocol:'file:'},setTimeout:()=>0,clearTimeout(){}});for(const f of ['planner.js','planner-ui.js','app.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',f),'utf8'),ctx);vm.runInContext('showForecast(60);showAllocation();smartPurchaseResult({get:k=>k==="amount"?"10":""})',ctx);assert.equal(writes,0);assert.equal(vm.runInContext('JSON.stringify(state)',ctx),raw);assert.ok(element('main').innerHTML.includes('Доступно для покупок'));assert.ok(element('purchase-result').innerHTML.includes('Минимум'))});
+test('PWA install caches all assets, activation deletes only app caches and never touches data',async()=>{const listeners={},deleted=[],assets=[];const cached=new Map();const ctx=vm.createContext({URL,self:{location:{origin:'https://example.test'},addEventListener:(n,f)=>listeners[n]=f},caches:{open:async()=>({addAll:async urls=>{for(const url of urls){assert.ok(fs.existsSync(path.join(__dirname,'..',url)));assets.push(url)}},match:async req=>cached.get(req.url)}),keys:async()=>['my-money-v01-20261018-b','my-money-v02-20261018-1','my-money-v02-20261018-2','my-money-v03-20261018-1','my-money-v03-20261018-2','unrelated-cache'],delete:async k=>deleted.push(k)},fetch:async()=>{throw Error('offline')}});vm.runInContext(fs.readFileSync(path.join(__dirname,'..','sw.js'),'utf8'),ctx);let pending;listeners.install({waitUntil:p=>pending=p});await pending;assert.ok(assets.includes('./planner.js'));listeners.activate({waitUntil:p=>pending=p});await pending;assert.deepEqual(deleted,['my-money-v01-20261018-b','my-money-v02-20261018-1','my-money-v02-20261018-2','my-money-v03-20261018-1']);cached.set('https://example.test/app.js','cached script');listeners.fetch({request:{method:'GET',url:'https://example.test/app.js'},respondWith:p=>pending=p});assert.equal(await pending,'cached script');assert.equal(vm.runInContext('typeof localStorage',ctx),'undefined');assert.equal(vm.runInContext('typeof indexedDB',ctx),'undefined');assert.equal(fs.readFileSync(path.join(__dirname,'..','sw.js'),'utf8').includes('skipWaiting'),false)});
+test('salary cents are conserved across two payments',()=>{const s=fixture();s.settings.salary=1000.01;assert.equal(P.forecast(s,'2026-09-01',30).events.filter(e=>e.kind==='salary').reduce((n,e)=>n+Math.round(e.amount*100),0),100001)});
+test('allocation invariants across synthetic budget combinations',()=>{for(const balance of [0,50,501.17,1000])for(const salary of [0,1000])for(const amount of [25,700,2000]){const s=fixture();Object.assign(s.settings,{startingBalance:balance,salary,savingsTarget:300,foodLimit:151.13,taxiLimit:33.12});s.obligations=[bill('2026-09-05',amount)];const a=P.allocation(s,'2026-09-01');const total=a.mandatory+a.living+a.futureReserve+a.savings+a.unallocated;assert.ok(Math.abs(total-a.funds)<0.0001);assert.ok(a.savings>=0&&a.savings<=a.desired);assert.ok(a.savings<=Math.max(0,a.forecast.minimum));assert.ok(a.forecast.available<=Math.max(0,a.forecast.initialFree))}});
+test('legacy JSON import/export preserves records, optional fields and unknown metadata',async()=>{const s=fixture();delete s.wishes;s.customMetadata={example:'synthetic'};s.transactions=[{id:'synthetic',date:'2026-09-01',type:'income',amount:123.45,legacyField:'keep'}];let stored=null,exported=null;const listeners={};const element=()=>({innerHTML:'',dataset:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},close(){},showModal(){}});const ctx=vm.createContext({structuredClone,console,Date,Math,Set,Map,JSON,Number,String,localStorage:{getItem:()=>null,setItem:(k,v)=>stored=v},document:{getElementById:element,querySelectorAll:()=>[],addEventListener:(n,f)=>listeners[n]=f},navigator:{},location:{protocol:'file:'},setTimeout:()=>0,clearTimeout(){},confirm:()=>true});for(const f of ['planner.js','planner-ui.js','app.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',f),'utf8'),ctx);listeners.change({target:{id:'import-json',files:[{text:async()=>JSON.stringify(s)}]}});await new Promise(resolve=>setImmediate(resolve));assert.ok(stored);const imported=JSON.parse(stored);assert.deepEqual(imported.transactions,s.transactions);assert.deepEqual(imported.customMetadata,s.customMetadata);ctx.capture=data=>exported=data;vm.runInContext('downloadFile=(name,data)=>capture(data);exportJSON()',ctx);assert.deepEqual(JSON.parse(exported),imported)});
+test('every category has plan/actual/remaining/percent; channels are not categories',()=>{
+ const s=fixture();s.settings.categoryBudgets=Object.fromEntries(P.categories.map(c=>[c,100]));
+ s.transactions=P.categories.map((c,i)=>({type:'expense',method:'cash',category:c,date:'2026-09-01',amount:25,channel:i%2?'marketplace':'delivery'}));
+ s.transactions.push({type:'debt_payment',category:'Жильё',date:'2026-09-01',amount:80},{type:'expense',category:'Жильё',date:'2026-09-10',amount:10,method:'cash'});
+ const rows=P.budgetSummary(s,'2026-09','2026-09-01');assert.equal(rows.length,15);
+ for(const row of rows){assert.equal(row.limit,100);assert.equal(row.actual,25);assert.equal(row.remaining,75);assert.equal(row.percent,25)}
+ assert.ok(!P.categories.includes('Маркетплейсы'));assert.ok(!P.categories.includes('Доставки'));
+});
+test('new category budgets deduct past purchases and obligations only once',()=>{
+ const s=fixture();Object.assign(s.settings,{salary:0,categoryBudgets:{'Жильё':300,'Красота':100}});
+ s.transactions=[{type:'expense',method:'cash',category:'Красота',amount:25,date:'2026-09-01',channel:'marketplace'}];
+ s.obligations=[bill('2026-09-05',200,'once',{category:'Жильё'})];
+ const f=P.forecast(s,'2026-09-01',30);assert.equal(f.end,600);assert.equal(f.events.filter(e=>e.kind==='living').reduce((n,e)=>n+Math.round(-e.amount*100),0),17500);
+});
+test('transport budget replaces legacy taxi and food replaces legacy food, zero is explicit',()=>{
+ const s=fixture();Object.assign(s.settings,{salary:0,foodLimit:500,taxiLimit:500,categoryBudgets:{'Продукты':0,'Транспорт':100}});
+ s.transactions=[{type:'expense',method:'cash',category:'Транспорт',channel:'taxi',date:'2026-09-01',amount:20},{type:'expense',method:'cash',category:'Транспорт',date:'2026-09-01',amount:30}];
+ const f=P.forecast(s,'2026-09-01',30);assert.equal(f.end,900);const row=P.budgetSummary(s,'2026-09','2026-09-01').find(b=>b.category==='Транспорт');assert.equal(row.actual,50);assert.equal(row.legacyTaxi,false);
+});
+test('separate expected expense differs from maximum; explicit zero forecast honored',()=>{
+ const s=fixture();Object.assign(s.settings,{salary:0,categoryBudgets:{'Здоровье':500},categoryForecasts:{'Здоровье':100}});
+ let f=P.forecast(s,'2026-09-01',30);assert.equal(f.end,900);assert.equal(f.conservative,false);assert.equal(P.budgetSummary(s,'2026-09')[4].limit,500);
+ delete s.settings.categoryForecasts['Здоровье'];f=P.forecast(s,'2026-09-01',30);assert.equal(f.end,500);assert.equal(f.conservative,true);
+ s.settings.categoryForecasts['Здоровье']=0;assert.equal(P.forecast(s,'2026-09-01',30).end,1000);
+});
+test('actual expense above budget has negative remainder, >100% and no negative future expense',()=>{
+ const s=fixture();Object.assign(s.settings,{salary:0,categoryBudgets:{'Спорт':100}});s.transactions=[{type:'expense',category:'Спорт',method:'cash',date:'2026-09-01',amount:120}];
+ const row=P.budgetSummary(s,'2026-09')[5];assert.equal(row.remaining,-20);assert.equal(row.percent,120);assert.equal(P.forecast(s,'2026-09-01',30).end,880);
+});
+test('known bill after horizon is deducted from full-month pool but not debited early',()=>{
+ const s=fixture();Object.assign(s.settings,{salary:0,categoryBudgets:{'Жильё':300}});s.obligations=[bill('2026-09-30',300,'once',{category:'Жильё'})];
+ assert.equal(P.forecast(s,'2026-09-01',15).end,1000);assert.equal(P.forecast(s,'2026-09-01',30).end,700);
+});
+test('credit purchase uses category budget; repayment is a separate cash event',()=>{
+ const s=fixture();Object.assign(s.settings,{salary:0,categoryBudgets:{'Одежда и обувь':300}});s.transactions=[{type:'expense',category:'Одежда и обувь',method:'debt',date:'2026-09-01',amount:300}];
+ s.obligations=[bill('2026-09-05',100,'once',{category:'Одежда и обувь',type:'debt'})];
+ const f=P.forecast(s,'2026-09-01',30);assert.equal(f.end,900);assert.equal(P.budgetSummary(s,'2026-09')[7].actual,300);
+});
+test('first deficit date differs from maximum deficit date including starting deficit',()=>{
+ const s=fixture();Object.assign(s.settings,{salary:0,startingBalance:50});s.obligations=[bill('2026-09-02',100),bill('2026-09-10',100,'once',{id:'later'})];
+ let f=P.forecast(s,'2026-09-01');assert.equal(f.firstDeficitDate,'2026-09-02');assert.equal(f.maxDeficitDate,'2026-09-10');assert.equal(f.minimum,-150);
+ s.settings.startingBalance=-10;assert.equal(P.forecast(s,'2026-09-01').firstDeficitDate,'2026-09-01');s.settings.startingBalance=1000;assert.equal(P.forecast(s,'2026-09-01').firstDeficitDate,null);
+});
+test('allocation exposes required, funded and uncovered amounts without writing reserves',()=>{
+ const s=fixture();Object.assign(s.settings,{startingBalance:70,salary:0});s.transactions=[{type:'reserve',date:'2026-09-01',amount:20}];s.obligations=[bill('2026-09-02',100)];
+ const original=JSON.stringify(s),a=P.allocation(s,'2026-09-01');assert.equal(a.alreadyReserved,20);assert.equal(a.funds,50);assert.equal(a.mandatoryRequired,100);assert.equal(a.mandatory,50);assert.equal(a.mandatoryUncovered,50);assert.equal(a.savings,0);assert.equal(JSON.stringify(s),original);
+});
+test('budget settings preserve unrelated keys, do not rewrite financial records; UI explains proposal',()=>{
+ const s=fixture();s.settings.categoryBudgets={'Custom legacy category':7};s.settings.categoryForecasts={'Здоровье':20};const raw=JSON.stringify(s),els=new Map();let writes=0;
+ const element=id=>{if(!els.has(id))els.set(id,{innerHTML:'',dataset:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},showModal(){},close(){}});return els.get(id)};
+ const ctx=vm.createContext({structuredClone,Date,Math,Set,Map,JSON,Number,String,localStorage:{getItem:()=>raw,setItem(){writes++}},document:{getElementById:element,querySelectorAll:()=>[],addEventListener(){}},navigator:{},location:{protocol:'file:'},setTimeout:()=>0,clearTimeout(){}});
+ for(const f of ['planner.js','planner-ui.js','app.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',f),'utf8'),ctx);
+ vm.runInContext('renderSettings();showAllocation()',ctx);assert.equal(writes,0);assert.equal(vm.runInContext('JSON.stringify(state)',ctx),raw);assert.ok(element('modal-body').innerHTML.includes('ещё не создано'));
+ vm.runInContext('saveCategoryBudgets({get:k=>k==="budget-4"?"100":k==="estimate-4"?"50":""})',ctx);
+ assert.equal(vm.runInContext('state.settings.categoryBudgets["Здоровье"]',ctx),100);assert.equal(vm.runInContext('state.settings.categoryBudgets["Custom legacy category"]',ctx),7);assert.equal(vm.runInContext('state.settings.categoryForecasts["Здоровье"]',ctx),50);assert.equal(vm.runInContext('JSON.stringify(state.transactions)',ctx),'[]');
+});
+test('legacy taxi sublimit does not hide total transport actuals',()=>{
+ const s=fixture();s.settings.taxiLimit=100;s.transactions=[{type:'expense',category:'Транспорт',method:'cash',date:'2026-09-01',amount:20,channel:'taxi'},{type:'expense',category:'Транспорт',method:'cash',date:'2026-09-01',amount:30}];
+ const row=P.budgetSummary(s,'2026-09')[3];assert.equal(row.actual,50);assert.equal(row.limit,0);assert.equal(row.percent,null);assert.equal(row.legacyTaxiBudget.actual,20);assert.equal(row.legacyTaxiBudget.remaining,80);s.settings.salary=0;s.settings.categoryForecasts={'Транспорт':100};assert.equal(P.forecast(s,'2026-09-01',30).end,900);assert.equal(P.budgetSummary(s,'2026-09')[3].taxiOnly,false);
+});
+test('v0.2 JSON with category settings survives application load and export without writes',()=>{
+ const s=fixture();Object.assign(s.settings,{categoryBudgets:{'Жильё':100,'Транспорт':0},categoryForecasts:{'Жильё':75},otherDaily:2});s.goals=[{id:'g',name:'Synthetic goal',target:50}];s.obligations=[bill('2026-09-05',25)];s.transactions=[{type:'reserve',date:'2026-09-01',amount:5,goalId:'g'}];let writes=0,out;
+ const raw=JSON.stringify(s),element=()=>({innerHTML:'',dataset:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},close(){},showModal(){}});
+ const ctx=vm.createContext({structuredClone,Date,Math,Set,Map,JSON,Number,String,localStorage:{getItem:()=>raw,setItem(){writes++}},document:{getElementById:element,querySelectorAll:()=>[],addEventListener(){}},navigator:{},location:{protocol:'file:'},setTimeout:()=>0,clearTimeout(){},capture:value=>out=value});
+ for(const f of ['planner.js','planner-ui.js','app.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',f),'utf8'),ctx);
+ vm.runInContext('renderSettings();showForecast(60);showAllocation();downloadFile=(name,data)=>capture(data);exportJSON()',ctx);assert.equal(writes,0);assert.deepEqual(JSON.parse(out),s);
+});
+const purchaseInput=(extra={})=>({amount:20,category:'Продукты',urgency:'canwait',delivery:'yes',...extra});
+test('delivery totals use inclusive 7/30-day windows, real expense records and kopecks',()=>{
+ const s=fixture(),order=(date,amount,extra={})=>({type:'expense',category:'Продукты',channel:'delivery',method:'cash',date,amount,...extra});
+ s.transactions=[order('2026-10-18',0.1),order('2026-10-12',0.2,{method:'debt'}),order('2026-10-11',1.05),order('2026-09-19',2.25),order('2026-09-18',100),order('2026-10-19',100),order('2026-10-18',100,{category:'Красота'}),order('2026-10-18',100,{channel:'store',merchant:'Самокат'}),order('2026-10-18',100,{type:'debt_payment'})];
+ const h=P.deliveryHistory(s,'2026-10-18');assert.deepEqual(h.days7,{count:2,total:0.3});assert.deepEqual(h.days30,{count:4,total:3.6});assert.equal(h.emptyHistory,false);
+});
+test('empty delivery history reports zero observations without inventing purchases',()=>{
+ const s=fixture(),context=P.purchaseContext(s,'2026-10-18',purchaseInput());assert.equal(context.deliveries.emptyHistory,true);assert.deepEqual(context.deliveries.days30,{count:0,total:0});assert.ok(!context.recommendations.some(t=>/уже было/.test(t)));
+ s.transactions=[{type:'income',date:'2026-10-18',amount:100}];assert.equal(P.deliveryHistory(s,'2026-10-18').emptyHistory,false);assert.equal(P.deliveryHistory(s,'2026-10-18').days7.count,0);
+});
+test('optional grocery delivery recommends checking food at home, postponing and combining',()=>{
+ const c=P.purchaseContext(fixture(),'2026-10-18',purchaseInput());const text=c.recommendations.join(' ');for(const phrase of ['есть ли дома продукты','отложить заказ','объединить'])assert.ok(text.includes(phrase));assert.ok(!P.purchaseContext(fixture(),'2026-10-18',purchaseInput({delivery:'no'})).recommendations.join(' ').includes('есть ли дома продукты'));
+ assert.ok(!P.purchaseContext(fixture(),'2026-10-18',purchaseInput({category:'Красота'})).recommendations.join(' ').includes('есть ли дома продукты'));
+});
+test('impulse recommendation includes pause with and without delivery',()=>{
+ for(const delivery of ['yes','no']){const c=P.purchaseContext(fixture(),'2026-10-18',purchaseInput({urgency:'impulse',delivery}));assert.ok(c.recommendations.join(' ').includes('паузу 48 часов'));assert.equal(c.urgency,'impulse')}
+});
+test('necessary purchase gets consequences without impulse or optional-delivery pressure',()=>{
+ const c=P.purchaseContext(fixture(),'2026-10-18',purchaseInput({urgency:'need'})),text=c.recommendations.join(' ');assert.ok(text.includes('автоматического запрета нет'));assert.ok(!text.includes('паузу'));assert.ok(!text.includes('необязательной доставкой'));
+});
+test('purchase category overage includes past credit purchases, not repayments or future entries',()=>{
+ const s=fixture();s.settings.categoryBudgets={'Красота':100};s.transactions=[{type:'expense',method:'debt',category:'Красота',channel:'marketplace',date:'2026-10-18',amount:90},{type:'debt_payment',category:'Красота',date:'2026-10-18',amount:50},{type:'expense',method:'cash',category:'Красота',date:'2026-10-19',amount:100}];
+ const b=P.purchaseContext(s,'2026-10-18',purchaseInput({category:'Красота'})).budget;assert.equal(b.actual,90);assert.equal(b.after,110);assert.equal(b.overage,10);assert.equal(b.additionalOverage,10);
+});
+test('budget check distinguishes unset, explicit zero and an already exceeded budget',()=>{
+ const s=fixture();assert.equal(P.purchaseContext(s,'2026-10-18',purchaseInput()).budget.configured,false);s.settings.categoryBudgets={'Продукты':0};let b=P.purchaseContext(s,'2026-10-18',purchaseInput()).budget;assert.equal(b.configured,true);assert.equal(b.overage,20);
+ s.settings.categoryBudgets['Продукты']=100;s.transactions=[{type:'expense',category:'Продукты',date:'2026-10-18',amount:120}];b=P.purchaseContext(s,'2026-10-18',purchaseInput()).budget;assert.equal(b.overage,40);assert.equal(b.additionalOverage,20);
+});
+test('legacy taxi limit remains a taxi sublimit even with a separate transport forecast',()=>{
+ const s=fixture();s.settings.taxiLimit=100;s.settings.categoryForecasts={'Транспорт':300};s.transactions=[{type:'expense',category:'Транспорт',date:'2026-10-18',amount:50,channel:'taxi'},{type:'expense',category:'Транспорт',date:'2026-10-18',amount:70}];
+ assert.equal(P.purchaseContext(s,'2026-10-18',purchaseInput({category:'Транспорт',merchant:'Метро'})).budget.configured,false);const b=P.purchaseContext(s,'2026-10-18',purchaseInput({category:'Транспорт',merchant:'Яндекс Go',amount:60})).budget;assert.equal(b.actual,50);assert.equal(b.overage,10);
+});
+test('rendered purchase responses honor urgency/delivery, never write data, and show version 0.3',()=>{
+ const s=fixture();s.settings.startingBalance=5;s.settings.categoryBudgets={'Продукты':10};const raw=JSON.stringify(s),els=new Map();let writes=0;
+ const element=id=>{if(!els.has(id))els.set(id,{innerHTML:'',dataset:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},showModal(){},close(){}});return els.get(id)};
+ const ctx=vm.createContext({structuredClone,Date,Math,Set,Map,JSON,Number,String,localStorage:{getItem:()=>raw,setItem(){writes++}},document:{getElementById:element,querySelectorAll:()=>[],addEventListener(){}},navigator:{},location:{protocol:'file:'},setTimeout:()=>0,clearTimeout(){}});
+ for(const f of ['planner.js','planner-ui.js','app.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',f),'utf8'),ctx);
+ for(const urgency of ['need','impulse','canwait']){ctx.input=purchaseInput({urgency});vm.runInContext('smartPurchaseResult({get:k=>input[k]})',ctx);const html=element('purchase-result').innerHTML;assert.ok(html.includes('История операций пуста'));assert.ok(html.includes('Превышение бюджета после покупки'));assert.ok(html.includes('Минимум на 60 дней'));if(urgency==='need'){assert.ok(html.includes('Финансовые последствия необходимой покупки'));assert.ok(html.includes('автоматического запрета нет'));assert.ok(!html.includes('Покупка нарушает план'))}else if(urgency==='impulse')assert.ok(html.includes('паузу 48 часов'));else assert.ok(html.includes('есть ли дома продукты'))}
+ ctx.input=purchaseInput();vm.runInContext('state.settings.startingBalance=10000;smartPurchaseResult({get:k=>input[k]});state.settings.startingBalance=5',ctx);assert.ok(element('purchase-result').innerHTML.includes('Покупка нарушает план'));
+ assert.equal(writes,0);assert.equal(vm.runInContext('JSON.stringify(state)',ctx),raw);assert.ok(element('main').innerHTML.includes('v0.3'));assert.equal(vm.runInContext('STORAGE_KEY',ctx),'my-money-finances-v1');assert.equal(vm.runInContext('state.version',ctx),1);
+});
+function renderPurchaseFixture(s,input){
+ const raw=JSON.stringify(s),els=new Map();let writes=0;
+ const element=id=>{if(!els.has(id))els.set(id,{innerHTML:'',dataset:{},classList:{add(){},remove(){},toggle(){}},addEventListener(){},showModal(){},close(){}});return els.get(id)};
+ const ctx=vm.createContext({structuredClone,Date,Math,Set,Map,JSON,Number,String,localStorage:{getItem:()=>raw,setItem(){writes++}},document:{getElementById:element,querySelectorAll:()=>[],addEventListener(){}},navigator:{},location:{protocol:'file:'},setTimeout:()=>0,clearTimeout(){},input});
+ for(const f of ['planner.js','planner-ui.js','app.js'])vm.runInContext(fs.readFileSync(path.join(__dirname,'..',f),'utf8'),ctx);
+ vm.runInContext('today=()=>"2026-10-18";smartPurchaseResult({get:k=>input[k]})',ctx);
+ assert.equal(writes,0);assert.equal(vm.runInContext('JSON.stringify(state)',ctx),raw);
+ return element('purchase-result').innerHTML;
+}
+test('reserve warning requires real current reserves touched by this purchase, not merely a deficit',()=>{
+ const reserve=(amount,date='2026-10-18')=>({type:'reserve',amount,date});
+ const cases=[
+  {balance:50,transactions:[],amount:100,warn:false},
+  {balance:-10,transactions:[],amount:20,warn:false},
+  {balance:100,transactions:[reserve(40)],amount:60,warn:false},
+  {balance:100,transactions:[reserve(40)],amount:60.01,warn:true},
+  {balance:100,transactions:[reserve(40)],amount:20,warn:false},
+  {balance:100,transactions:[reserve(40),{type:'release',amount:40,date:'2026-10-18'}],amount:120,warn:false},
+  {balance:100,transactions:[reserve(40,'2026-10-19')],amount:120,warn:false},
+  {balance:100,transactions:[reserve(0.01)],amount:100,warn:true},
+  {balance:100,transactions:[reserve(40)],amount:20,warn:false,obligations:[bill('2026-10-19',90)]}
+ ];
+ for(const c of cases){const s=fixture();s.settings.startingBalance=c.balance;s.settings.salary=0;s.transactions=c.transactions;s.obligations=c.obligations||[];
+  const html=renderPurchaseFixture(s,purchaseInput({amount:c.amount}));assert.equal(html.includes('Покупка затрагивает уже зарезервированные накопления'),c.warn,JSON.stringify(c));
+ }
+});
+test('grocery delivery block is shown for groceries only, independent of delivery answer',()=>{
+ const s=fixture();s.transactions=[{type:'expense',method:'cash',category:'Продукты',channel:'delivery',date:'2026-10-18',amount:10}];
+ for(const category of P.categories)for(const delivery of ['yes','no']){
+  const html=renderPurchaseFixture(s,purchaseInput({category,delivery}));
+  assert.equal(html.includes('Внесённые доставки продуктов'),category==='Продукты',category+' '+delivery);
+  assert.equal(html.includes('Последние 7 дней'),category==='Продукты');assert.equal(html.includes('Последние 30 дней'),category==='Продукты');
+  assert.ok(html.includes('Бюджет: '+category));assert.ok(html.includes('Минимум на 60 дней'));
+ }
+});
