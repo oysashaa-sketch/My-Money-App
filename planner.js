@@ -25,9 +25,9 @@ function budgetSummary(state,month,asOf){
  return categories.map(category=>{
   const c=budgetConfig(state.settings,category);
   const purchases=state.transactions.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&(!asOf||t.date<=asOf)&&t.category===category);
-  const actual=purchases.reduce((n,t)=>n+cents(t.amount),0),limit=c.legacyTaxi?0:c.limit;
+  const actual=purchases.reduce((n,t)=>n+cents(t.amount),0),once=cents(F.oneOffCosts(state,month,[category])[category]),limit=c.legacyTaxi?0:c.limit+once;
   const taxiActual=purchases.filter(taxi).reduce((n,t)=>n+cents(t.amount),0);
-  return {...c,limit:rub(limit),estimate:rub(c.estimate),actual:rub(actual),remaining:rub(limit-actual),percent:limit>0?actual/limit*100:null,legacyTaxiBudget:c.legacyTaxi?{limit:rub(c.limit),actual:rub(taxiActual),remaining:rub(c.limit-taxiActual),percent:c.limit>0?taxiActual/c.limit*100:null}:null};
+  return {...c,regularLimit:rub(c.limit),oneOff:rub(once),limit:rub(limit),estimate:rub(c.estimate),actual:rub(actual),remaining:rub(limit-actual),percent:limit>0?actual/limit*100:null,legacyTaxiBudget:c.legacyTaxi?{limit:rub(c.limit),actual:rub(taxiActual),remaining:rub(c.limit-taxiActual),percent:c.limit>0?taxiActual/c.limit*100:null}:null};
  });
 }
 function occurrences(state,to){return F.schedule(state,to).filter(o=>o.status!=='paid')}
@@ -52,8 +52,8 @@ function forecast(state,from,days=60,purchase=0){
    let total=0;
    for(const category of categories){
     const config=budgetConfig(s,category);
-    const spent=tx.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&matches(t,config)).reduce((a,t)=>a+cents(t.amount),0);
-    const planned=obs.filter(o=>o.type!=='debt'&&o.due.slice(0,7)===month&&matches(o,config)).reduce((a,o)=>a+cents(o.amount),0);
+    const spent=tx.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&matches(t,config)&&!F.isOneOff(state,t)).reduce((a,t)=>a+cents(t.amount),0);
+    const planned=obs.filter(o=>o.type!=='debt'&&!F.isOneOff(state,o)&&o.due.slice(0,7)===month&&matches(o,config)).reduce((a,o)=>a+cents(o.amount),0);
     total+=Math.max(0,config.estimate-spent-planned);
    }
    total+=cents(s.otherDaily)*count;
@@ -66,7 +66,7 @@ function forecast(state,from,days=60,purchase=0){
  let minimum=initialFree,minDate=from,firstDeficitDate=initialFree<0?from:null;
  for(const e of events){if(e.consumePool){const use=Math.min(Math.max(0,pools[e.consumePool]||0),Math.max(0,-e.delta));e.reserveDelta-=use;pools[e.consumePool]=(pools[e.consumePool]||0)-use;}if(e.poolKey)pools[e.poolKey]=(pools[e.poolKey]||0)+(e.poolDelta||0);cash+=e.delta;saved+=e.reserveDelta;e.cash=rub(cash);e.free=rub(cash-saved);e.amount=rub(e.delta);if(cash-saved<0&&!firstDeficitDate)firstDeficitDate=e.date;if(cash-saved<minimum){minimum=cash-saved;minDate=e.date}}
  const target=Math.max(0,cents(s.savingsPlans?.[from.slice(0,7)]?.target??s.savingsTarget)-tx.filter(t=>!t.fundingKey&&t.date<=from&&t.date.slice(0,7)===from.slice(0,7)).reduce((a,t)=>a+reserve(t),0));
- return {from,to,events,firstDeficitDate,maxDeficitDate:minimum<0?minDate:null,conservative:categories.some(c=>{const b=budgetConfig(s,c);return b.conservative&&b.estimate>0}),initialCash:rub(initialCash),initialFree:rub(initialFree),minimum:rub(minimum),minDate,end:rub(cash-saved),savingsRemaining:rub(target),available:rub(Math.max(0,minimum-target)),missingBasics:categories.some(c=>budgetConfig(s,c).estimate===0)};
+ return {from,to,events,budgetIncomplete:F.budgetKnowledge(state,from,categories).missing.length>0,firstDeficitDate,maxDeficitDate:minimum<0?minDate:null,conservative:categories.some(c=>{const b=budgetConfig(s,c);return b.conservative&&b.estimate>0}),initialCash:rub(initialCash),initialFree:rub(initialFree),minimum:rub(minimum),minDate,end:rub(cash-saved),savingsRemaining:rub(target),available:rub(Math.max(0,minimum-target)),missingBasics:categories.some(c=>budgetConfig(s,c).estimate===0)};
 }
 function allocation(state,from){
  const f=forecast(state,from),next=paydays(from,add(from,40))[0];
@@ -93,11 +93,12 @@ function purchaseContext(state,from,input){
  if(urgency==='need')recommendations.push('Покупка отмечена как необходимая. Ниже показаны её финансовые последствия; решение остаётся за тобой, автоматического запрета нет.');
  else if(urgency==='canwait')recommendations.push('Покупку можно отложить: сравни её стоимость с доступной суммой и оставшимся бюджетом.');
  const config=budgetConfig(state.settings,input.category),item={category:input.category,merchant:input.merchant||''};
- const configured=Object.hasOwn(state.settings.categoryBudgets||{},input.category)||config.limit>0;
+ const monthlyLimit=config.limit+cents(F.oneOffCosts(state,from.slice(0,7),[input.category])[input.category]);
+ const configured=Object.hasOwn(state.settings.categoryBudgets||{},input.category)||monthlyLimit>0;
  const applicable=configured&&(!config.legacyTaxi||taxi(item)),budgetScope={...config,taxiOnly:config.legacyTaxi};
  const actual=state.transactions.filter(t=>t.type==='expense'&&t.date<=from&&t.date.slice(0,7)===from.slice(0,7)&&matches(t,budgetScope)).reduce((n,t)=>n+cents(t.amount),0);
- const after=actual+nonnegative(input.amount),over=applicable?Math.max(0,after-config.limit):0;
- return {urgency,recommendations,deliveries:deliveryHistory(state,from),budget:{configured:applicable,taxiOnly:config.legacyTaxi,limit:rub(config.limit),actual:rub(actual),after:rub(after),overage:rub(over),additionalOverage:rub(Math.max(0,over-Math.max(0,actual-config.limit)))}};
+ const after=actual+nonnegative(input.amount),over=applicable?Math.max(0,after-monthlyLimit):0;
+ return {urgency,recommendations,deliveries:deliveryHistory(state,from),budget:{configured:applicable,taxiOnly:config.legacyTaxi,limit:rub(monthlyLimit),actual:rub(actual),after:rub(after),overage:rub(over),additionalOverage:rub(Math.max(0,over-Math.max(0,actual-monthlyLimit)))}};
 }
 const api={forecast,allocation,paydays,occurrences,add,categories,budgetConfig,budgetSummary,deliveryHistory,purchaseContext};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyPlanner=api;
 })(globalThis);

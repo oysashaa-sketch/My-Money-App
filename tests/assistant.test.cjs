@@ -99,11 +99,11 @@ test('funding plan rejects excessive amounts and post-payment financing dates',(
 });
 test('proposal is preliminary without history, uses known bills and changes limits only on acceptance',()=>{
  const s=fixture();s.settings.salary=1000;s.settings.savingsTarget=250;s.obligations=[bill({type:'bill',debtId:'',category:'Жильё',amount:300})];const raw=JSON.stringify(s),p=F.proposeBudget(s,day,P.categories);
- assert.equal(p.preliminary,true);assert.equal(p.limits['Жильё'],300);assert.equal(p.limits['Красота'],0);assert.ok(p.missing.includes('Красота'));assert.equal(JSON.stringify(s),raw);
+ assert.equal(p.preliminary,true);assert.equal(p.limits['Жильё'],300);assert.equal(p.limits['Красота'],null);assert.ok(p.missing.includes('Красота'));assert.equal(JSON.stringify(s),raw);
  const out=F.acceptBudget(s,{...p.limits,'Красота':25},P.categories);assert.equal(out.settings.categoryBudgets['Красота'],25);assert.deepEqual(out.transactions,s.transactions);assert.deepEqual(out.obligations,s.obligations);assert.equal(out.settings.savingsTarget,250);
 });
 test('budget proposal uses observed history without counting channels twice and reduces optional categories',()=>{
- const s=fixture();s.settings.salary=1000;s.settings.savingsTarget=200;s.transactions=[{type:'expense',category:'Продукты',channel:'delivery',date:'2026-08-10',amount:300},{type:'expense',category:'Продукты',channel:'marketplace',date:'2026-09-10',amount:300},{type:'expense',category:'Красота',channel:'marketplace',date:'2026-08-15',amount:1000}];
+ const s=fixture();s.settings.salary=1000;s.settings.savingsTarget=200;s.transactions=[{type:'expense',category:'Продукты',channel:'delivery',date:'2026-08-10',amount:300},{type:'expense',category:'Продукты',channel:'marketplace',date:'2026-09-10',amount:300},{type:'expense',category:'Красота',channel:'marketplace',date:'2026-08-15',amount:1000},{type:'expense',category:'Красота',channel:'marketplace',date:'2026-09-15',amount:1000}];
  const p=F.proposeBudget(s,day,P.categories);assert.equal(p.observedMonths,2);assert.equal(p.limits['Продукты'],300);assert.equal(p.limits['Красота'],500);assert.equal(p.savings,200);assert.ok(!Object.hasOwn(p.limits,'Доставка'));
 });
 test('budget cannot hide required monthly deficit or promise unaffordable savings',()=>{
@@ -170,4 +170,63 @@ test('agreed realistic monthly savings target replaces only this month forecast 
 test('failure to persist deletion of a linked payment keeps the original history and coverage',()=>{
  let s=fixture();s.obligations=[bill()];s=pay(s,{obligationId:'o',forDue:'2026-10-20',amount:100,bankBalance:900}).state;
  const h=ui(s);h.run('localStorage.setItem=()=>{throw Error("full")};deleteItem("transaction","tx")');assert.deepEqual(h.snapshot(),s);assert.equal(F.schedule(h.snapshot(),'2026-10-20')[0].status,'paid');
+});
+test('salary without history produces unknown categories, not recommended zero budgets or safe spending',()=>{
+ const s=fixture();s.settings.salary=240000;s.settings.savingsTarget=25000;const p=F.proposeBudget(s,day,P.categories);
+ assert.equal(p.limits['Продукты'],null);assert.equal(p.limits['Здоровье'],null);assert.equal(p.complete,false);assert.equal(p.extraDebt,0);assert.ok(p.missing.length>0);assert.equal(JSON.stringify(s),JSON.stringify(fixture()).replace('"salary":2000','"salary":240000').replace('"savingsTarget":0','"savingsTarget":25000'));
+});
+test('setup asks unknown spending only and preserves prefilled settings and recurring bills',()=>{
+ const s=fixture();s.settings.foodLimit=30000;s.obligations=[bill({type:'bill',debtId:'',category:'Жильё',amount:50000})];const k=F.budgetKnowledge(s,day,P.categories);assert.ok(!k.missing.includes('Продукты'));assert.ok(!k.missing.includes('Жильё'));assert.ok(k.missing.includes('Здоровье'));
+ const h=ui(s);h.run('showBudgetProposal()');const html=h.element('modal-body').innerHTML;assert.ok(html.includes('Укажи ориентиры только для неизвестных'));assert.ok(html.includes('initial-4'));assert.ok(!html.includes('name="initial-1"'));assert.ok(!html.includes('name="initial-0"'));assert.ok(html.includes('<details>'));assert.equal(h.writes(),0);
+});
+test('primary setup drafts yield a useful nonzero preliminary budget only after user estimates',()=>{
+ const s=fixture();s.settings.salary=240000;s.settings.savingsTarget=25000;s.obligations=[bill({type:'bill',debtId:'',category:'Жильё',amount:50000})];const draft={'Продукты':{amount:30000,essential:true},'Транспорт':{amount:10000,essential:true},'Здоровье':{amount:5000,essential:true},'Кафе и рестораны':{amount:8000,essential:false},'Красота':{amount:7000,essential:false},'Другое':{amount:5000,essential:true}};
+ const p=F.proposeBudget(s,day,P.categories,draft);assert.equal(p.limits['Продукты'],30000);assert.equal(p.limits['Жильё'],50000);assert.equal(p.limits['Здоровье'],5000);assert.equal(p.savings,25000);assert.equal(p.complete,false);assert.equal(s.settings.budgetEstimates,undefined);
+ const out=F.acceptBudget(s,p.limits,P.categories,draft);assert.equal(out.settings.budgetEstimates['Здоровье'].amount,5000);assert.deepEqual(out.transactions,s.transactions);assert.deepEqual(out.debts,s.debts);assert.deepEqual(out.obligations,s.obligations);
+});
+test('one-time medical payment appears in its month only, never as permanent health budget',()=>{
+ const s=fixture();s.settings.salary=240000;s.settings.savingsTarget=25000;s.settings.categoryBudgets={'Здоровье':5000};s.obligations=[bill({id:'medical',type:'bill',debtId:'',category:'Здоровье',amount:43000,firstDue:'2026-11-06',frequency:'once'})];
+ const nov=F.proposeBudget(s,'2026-11-01',P.categories),dec=F.proposeBudget(s,'2026-12-01',P.categories);assert.equal(nov.oneOffTotal,43000);assert.equal(nov.limits['Здоровье'],5000);assert.equal(nov.monthlyLimits['Здоровье'],48000);assert.equal(dec.oneOffTotal,0);assert.equal(dec.limits['Здоровье'],5000);
+ const out=F.acceptBudget(s,nov.limits,P.categories);assert.equal(out.settings.categoryBudgets['Здоровье'],5000);assert.equal(out.obligations.length,1);
+});
+test('one-time medical payment is forecast once in addition to regular health spending',()=>{
+ const s=fixture();s.settings.startingBalance=100000;s.settings.salary=0;s.settings.categoryBudgets={'Здоровье':5000};s.obligations=[bill({type:'bill',debtId:'',category:'Здоровье',amount:43000,firstDue:'2026-11-06',frequency:'once'})];
+ const f=P.forecast(s,'2026-11-01',30);assert.equal(f.events.filter(e=>e.kind==='obligation').length,1);assert.equal(f.end,52000);const row=P.budgetSummary(s,'2026-11','2026-11-01')[4];assert.equal(row.limit,48000);assert.equal(row.regularLimit,5000);assert.equal(row.oneOff,43000);
+});
+test('paid one-off bill is excluded from recurring history without hiding the real expense',()=>{
+ let s=fixture();s.settings.startingBalance=100000;s.settings.salary=0;s.settings.categoryBudgets={'Здоровье':5000};s.obligations=[bill({type:'bill',debtId:'',category:'Здоровье',amount:43000,firstDue:'2026-11-06',frequency:'once'})];s=pay(s,{date:'2026-11-06',amount:43000,debtId:'',obligationId:'o',forDue:'2026-11-06'}).state;
+ assert.equal(P.forecast(s,'2026-11-07',24).end,52000);assert.equal(F.proposeBudget(s,'2026-12-01',P.categories).limits['Здоровье'],5000);assert.equal(P.budgetSummary(s,'2026-11','2026-11-07')[4].actual,43000);assert.equal(F.cash(s,'2026-11-07'),57000);
+ const b=P.purchaseContext(s,'2026-11-07',{category:'Здоровье',amount:1000}).budget;assert.equal(b.overage,0);
+});
+test('single unclassified historical expense is not extrapolated into a recurring monthly estimate',()=>{
+ const s=fixture();s.transactions=[{type:'expense',category:'Здоровье',method:'cash',date:'2026-09-01',amount:43000}];const p=F.proposeBudget(s,day,P.categories);assert.equal(p.limits['Здоровье'],null);assert.ok(p.missing.includes('Здоровье'));
+});
+test('necessary user estimates are preserved even when savings must fall or deficit remains',()=>{
+ const s=fixture();s.settings.salary=100000;s.settings.savingsTarget=25000;s.obligations=[bill({type:'bill',debtId:'',category:'Жильё',amount:50000})];let draft={'Продукты':{amount:40000,essential:true},'Транспорт':{amount:5000,essential:true}};
+ let p=F.proposeBudget(s,day,P.categories,draft);assert.equal(p.savings,5000);assert.equal(p.limits['Продукты'],40000);assert.equal(p.limits['Транспорт'],5000);
+ draft['Здоровье']={amount:20000,essential:true};p=F.proposeBudget(s,day,P.categories,draft);assert.equal(p.savings,0);assert.equal(p.deficit,15000);assert.equal(p.limits['Здоровье'],20000);assert.equal(s.settings.savingsTarget,25000);
+});
+test('unknown values stay absent on acceptance; explicit user zero is confirmed and remembered',()=>{
+ const s=fixture();s.settings.categoryBudgets={'Красота':0};const p=F.proposeBudget(s,day,P.categories);assert.ok(p.missing.includes('Красота'));
+ const out=F.acceptBudget(s,p.limits,P.categories);assert.ok(!Object.hasOwn(out.settings.categoryBudgets,'Продукты'));assert.equal(out.settings.categoryBudgets['Красота'],0);assert.ok(F.budgetKnowledge(out,day,P.categories).missing.includes('Красота'));
+ const yes=F.acceptBudget(s,{'Красота':0},P.categories);assert.ok(!F.budgetKnowledge(yes,day,P.categories).missing.includes('Красота'));
+});
+test('incomplete budget hides safe-spending claims on home and purchase check',()=>{
+ const s=fixture();s.settings.startingBalance=500000;s.settings.salary=240000;const h=ui(s);h.run('render();smartPurchaseResult({get:k=>({amount:10,category:"Красота",urgency:"canwait",delivery:"no"})[k]})');
+ assert.ok(h.element('main').innerHTML.includes('Не подтверждено'));assert.ok(h.element('purchase-result').innerHTML.includes('безопасность покупки не подтверждена'));assert.ok(!h.element('purchase-result').innerHTML.includes('✓ Покупка укладывается'));assert.equal(h.writes(),0);
+});
+test('compact proposal starts with totals and has collapsed categories rather than an open zero form',()=>{
+ const h=ui(fixture());h.run('showBudgetProposal({},true)');const html=h.element('modal-body').innerHTML;assert.ok(html.indexOf('Предложено в накопления')<html.indexOf('proposal-0'));assert.ok(html.includes('<details><summary>Раскрыть и изменить регулярные лимиты'));assert.ok(!html.includes('<details open>'));assert.ok(html.includes('это не безопасная сумма для покупок'));assert.equal(h.writes(),0);
+});
+test('cancelling onboarding or preview never changes existing records, goals, settings or loans',()=>{
+ const s=fixture();s.transactions=[{id:'old',type:'expense',date:day,amount:5,method:'cash',category:'Красота'}];s.goals=[{id:'goal',name:'Synthetic',target:100}];s.obligations=[bill()];const h=ui(s);h.run('showBudgetSetup();showBudgetProposal({"Здоровье":{amount:5000,essential:true}},true);modalClose()');assert.deepEqual(h.snapshot(),s);assert.equal(h.writes(),0);
+});
+test('setup records explicit zero and essential choices in a draft without saving until acceptance',()=>{
+ const s=fixture();const h=ui(s);h.ctx.answers={'initial-1':'30000','essential-1':'on','initial-3':'10000','essential-3':'on','initial-4':'0','essential-4':'on','no-other':'on'};
+ const draft=h.run('captureBudgetSetup({get:k=>answers[k]??null})');assert.equal(draft['Продукты'].amount,30000);assert.equal(draft['Продукты'].essential,true);assert.equal(draft['Здоровье'].amount,0);assert.equal(draft['Здоровье'].essential,true);assert.ok(!Object.hasOwn(draft,'Красота'));assert.equal(h.writes(),0);assert.deepEqual(h.snapshot(),s);
+ const out=F.acceptBudget(s,F.proposeBudget(s,day,P.categories,draft).limits,P.categories,draft);assert.equal(out.settings.budgetEstimates['Продукты'].amount,30000);assert.ok(!F.budgetKnowledge(out,day,P.categories).missing.includes('Здоровье'));
+});
+test('a fully answered preliminary budget still distinguishes monthly planning from spendable cash',()=>{
+ const s=fixture();s.settings.salary=240000;s.settings.startingBalance=500;const draft=Object.fromEntries(P.categories.map(cat=>[cat,{amount:0,essential:false}]));draft['Продукты']={amount:30000,essential:true};
+ const p=F.proposeBudget(s,day,P.categories,draft);assert.equal(p.preliminary,true);assert.equal(p.complete,true);assert.equal(p.missing.length,0);const accepted=F.acceptBudget(s,p.limits,P.categories,draft);const f=P.forecast(accepted,day);assert.equal(f.budgetIncomplete,false);assert.ok(f.available<=500);assert.equal(F.cash(accepted,day),500);
 });

@@ -98,33 +98,61 @@ function setFundingPlan(s,id,due,parts,asOf=due){
  const total=parts.reduce((n,p)=>n+c(p.amount),0),current=funding(s,id,due,asOf),outstanding=parts.filter(p=>!s.transactions.some(t=>t.fundingPlanId===p.id)).reduce((n,p)=>n+c(p.amount),0);if(total>c(o.amount)||c(current.reserved)+outstanding>c(current.amount))throw Error('План превышает стоимость платежа или его недофинансированный остаток');
  o.fundingPlan=[...(o.fundingPlan||[]).filter(p=>p.forDue!==due),...parts.map(p=>({...p,forDue:due,amount:r(c(p.amount))}))];return next;
 }
-function proposeBudget(s,from,categories){
- const month=from.slice(0,7),start=month+'-01',end=iso(new Date(date(from).getFullYear(),date(from).getMonth()+1,0,12));
- const historical=s.transactions.filter(t=>t.type==='expense'&&t.date>=add(from,-90)&&t.date<start);
- const months=[...new Set(historical.map(t=>t.date.slice(0,7)))];
- const known=schedule(s,end).filter(o=>o.due>=start),limits={},bases={},notes=[];
- let fixedDebt=0,required=0;
- for(const cat of categories){
-  const due=known.filter(o=>o.type!=='debt'&&o.category===cat).reduce((n,o)=>n+c(o.total),0);
-  const past=historical.filter(t=>t.category===cat).reduce((n,t)=>n+c(t.amount),0);
-  const current=s.transactions.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&t.date<=from&&t.category===cat).reduce((n,t)=>n+c(t.amount),0);
-  const estimate=months.length?Math.round(past/months.length):0;
-  const existing=Object.hasOwn(s.settings.categoryForecasts||{},cat)?c(s.settings.categoryForecasts[cat]):Object.hasOwn(s.settings.categoryBudgets||{},cat)?c(s.settings.categoryBudgets[cat]):cat==='Продукты'?c(s.settings.foodLimit):cat==='Транспорт'?c(s.settings.taxiLimit):0;
-  limits[cat]=r(Math.max(due,current,estimate,existing));bases[cat]=Math.max(due,current,['Жильё','Продукты','Транспорт','Здоровье','Подписки и связь'].includes(cat)?Math.max(estimate,existing):0);
-  if(!past&&!due&&!existing)notes.push(cat);
- }
- fixedDebt=known.filter(o=>o.type==='debt').reduce((n,o)=>n+c(o.total),0);
- const income=c(s.settings.salary),daily=c(s.settings.otherDaily)*date(end).getDate(),target=c(s.settings.savingsTarget??25000);
- const base=Object.values(bases).reduce((n,v)=>n+v,0),savings=Math.max(0,Math.min(target,income-fixedDebt-base-daily));
- const flexible=categories.reduce((n,cat)=>n+Math.max(0,c(limits[cat])-bases[cat]),0),room=Math.max(0,income-fixedDebt-base-daily-savings);
- let allocated=0;
- for(const cat of categories){const extra=Math.max(0,c(limits[cat])-bases[cat]),part=flexible>0?Math.min(extra,Math.floor(room*extra/flexible)):0;limits[cat]=r(bases[cat]+part);allocated+=bases[cat]+part;}
- const extraDebt=Math.min(Math.max(0,c(s.settings.allocationProposal?.extraDebt)),Math.max(0,income-fixedDebt-allocated-daily-savings));
- return {limits,income:r(income),fixedDebt:r(fixedDebt),daily:r(daily),savings:r(savings),target:r(target),extraDebt:r(extraDebt),deficit:r(Math.max(0,base+fixedDebt+daily-income)),preliminary:months.length<2||notes.length>0,missing:notes,observedMonths:months.length};
+function isOneOff(s,item){
+ if(item.spendingPattern==='once'||item.frequency==='once')return true;
+ return !!item.obligationId&&s.obligations.some(o=>o.id===item.obligationId&&o.frequency==='once');
 }
-function acceptBudget(s,limits,categories){
- const next=structuredClone(s);next.settings.categoryBudgets={...next.settings.categoryBudgets};
- for(const cat of categories){const n=Number(limits[cat]);if(!Number.isFinite(n)||n<0)throw Error('Лимиты должны быть неотрицательными');next.settings.categoryBudgets[cat]=r(c(n));}return next;
+function oneOffCosts(s,month,categories){
+ const end=iso(new Date(date(month+'-01').getFullYear(),date(month+'-01').getMonth()+1,0,12));
+ const out=Object.fromEntries(categories.map(cat=>[cat,0]));
+ for(const o of schedule(s,end).filter(o=>o.type!=='debt'&&o.due.slice(0,7)===month&&isOneOff(s,o)))if(Object.hasOwn(out,o.category))out[o.category]+=c(o.amount);
+ for(const t of s.transactions.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&isOneOff(s,t)))if(Object.hasOwn(out,t.category))out[t.category]+=c(t.amount);
+ return Object.fromEntries(Object.entries(out).map(([cat,v])=>[cat,r(v)]));
+}
+function budgetKnowledge(s,from,categories,draft={}){
+ const month=from.slice(0,7),end=iso(new Date(date(from).getFullYear(),date(from).getMonth()+1,0,12));
+ const recurring=schedule(s,end).filter(o=>o.type!=='debt'&&!isOneOff(s,o)&&o.due.slice(0,7)===month);
+ const historical=s.transactions.filter(t=>t.type==='expense'&&!isOneOff(s,t)&&t.date>=add(from,-90)&&t.date<month+'-01');
+ const sources={},missing=[],estimates={},essential={};
+ for(const cat of categories){
+  const input=Object.hasOwn(draft,cat)?draft[cat]:s.settings.budgetEstimates?.[cat];
+  const due=recurring.filter(o=>o.category===cat).reduce((n,o)=>n+c(o.total),0);
+  const entries=historical.filter(t=>t.category===cat),months=[...new Set(entries.map(t=>t.date.slice(0,7)))];
+  const existing=Object.hasOwn(s.settings.categoryForecasts||{},cat)?c(s.settings.categoryForecasts[cat]):Object.hasOwn(s.settings.categoryBudgets||{},cat)?c(s.settings.categoryBudgets[cat]):cat==='Продукты'?c(s.settings.foodLimit):cat==='Транспорт'?c(s.settings.taxiLimit):0;
+  let amount=null,source='unknown';
+  if(input!==undefined){const value=Number(typeof input==='object'?input.amount:input);if(!Number.isFinite(value)||value<0)throw Error('Ориентиры расходов должны быть неотрицательными');amount=Math.max(due,c(value));source='user';}
+  else if(existing>0||s.settings.categoryBudgetConfirmed?.[cat]){amount=Math.max(due,existing);source='settings';}
+  else if(due>0){amount=due;source='schedule';}
+  else if(months.length>=2||entries.some(t=>t.spendingPattern==='regular')){amount=Math.round(entries.reduce((n,t)=>n+c(t.amount),0)/Math.max(1,months.length));source='history';}
+  if(amount===null)missing.push(cat);
+  estimates[cat]=amount===null?null:r(amount);sources[cat]=source;
+  essential[cat]=input&&typeof input==='object'&&input.essential!==undefined?!!input.essential:['Жильё','Продукты','Транспорт','Здоровье','Подписки и связь'].includes(cat);
+ }
+ return {missing,estimates,sources,essential,observedMonths:new Set(historical.map(t=>t.date.slice(0,7))).size};
+}
+function proposeBudget(s,from,categories,draft={}){
+ const month=from.slice(0,7),end=iso(new Date(date(from).getFullYear(),date(from).getMonth()+1,0,12)),known=schedule(s,end).filter(o=>o.due.slice(0,7)===month);
+ const info=budgetKnowledge(s,from,categories,draft),oneOff=oneOffCosts(s,month,categories),limits={},bases={};
+ for(const cat of categories){
+  const due=known.filter(o=>o.type!=='debt'&&!isOneOff(s,o)&&o.category===cat).reduce((n,o)=>n+c(o.total),0);
+  const current=s.transactions.filter(t=>t.type==='expense'&&!isOneOff(s,t)&&t.date.slice(0,7)===month&&t.date<=from&&t.category===cat).reduce((n,t)=>n+c(t.amount),0);
+  limits[cat]=info.estimates[cat]===null?null:r(Math.max(due,current,c(info.estimates[cat])));
+  bases[cat]=Math.max(due,current,info.essential[cat]?c(info.estimates[cat]):0);
+ }
+ const fixedDebt=known.filter(o=>o.type==='debt').reduce((n,o)=>n+c(o.total),0),once=Object.values(oneOff).reduce((n,v)=>n+c(v),0);
+ const income=c(s.settings.salary),daily=c(s.settings.otherDaily)*date(end).getDate(),target=c(s.settings.savingsTarget??25000);
+ const base=Object.values(bases).reduce((n,v)=>n+v,0),savings=Math.max(0,Math.min(target,income-fixedDebt-once-base-daily));
+ const flexible=categories.reduce((n,cat)=>n+Math.max(0,c(limits[cat])-bases[cat]),0),room=Math.max(0,income-fixedDebt-once-base-daily-savings);
+ let allocated=0;
+ for(const cat of categories){const extra=Math.max(0,c(limits[cat])-bases[cat]),part=flexible>0?Math.min(extra,Math.floor(room*extra/flexible)):0;if(limits[cat]!==null)limits[cat]=r(bases[cat]+part);allocated+=bases[cat]+part;}
+ const remaining=Math.max(0,income-fixedDebt-once-allocated-daily-savings),extraDebt=info.missing.length?0:Math.min(Math.max(0,c(s.settings.allocationProposal?.extraDebt)),remaining);
+ return {limits,monthlyLimits:Object.fromEntries(categories.map(cat=>[cat,limits[cat]===null?null:r(c(limits[cat])+c(oneOff[cat]))])),oneOff,oneOffTotal:r(once),income:r(income),fixedDebt:r(fixedDebt),daily:r(daily),necessary:r(base),optional:r(allocated-base),savings:r(savings),target:r(target),extraDebt:r(extraDebt),unassigned:r(remaining-extraDebt),complete:info.missing.length===0,deficit:r(Math.max(0,base+fixedDebt+once+daily-income)),preliminary:info.observedMonths<2||info.missing.length>0,missing:info.missing,observedMonths:info.observedMonths,sources:info.sources};
+}
+function acceptBudget(s,limits,categories,estimates={}){
+ const next=structuredClone(s);next.settings.categoryBudgets={...next.settings.categoryBudgets};next.settings.categoryBudgetConfirmed={...next.settings.categoryBudgetConfirmed};
+ for(const cat of categories){if(limits[cat]===null||limits[cat]===undefined||limits[cat]==='')continue;const n=Number(limits[cat]);if(!Number.isFinite(n)||n<0)throw Error('Лимиты должны быть неотрицательными');next.settings.categoryBudgets[cat]=r(c(n));next.settings.categoryBudgetConfirmed[cat]=true;}
+ if(Object.keys(estimates).length){next.settings.budgetEstimates={...next.settings.budgetEstimates};for(const cat of categories)if(Object.hasOwn(estimates,cat)){const value=estimates[cat],n=Number(typeof value==='object'?value.amount:value);if(!Number.isFinite(n)||n<0)throw Error('Проверь ориентиры');next.settings.budgetEstimates[cat]={amount:r(c(n)),essential:typeof value==='object'?!!value.essential:['Жильё','Продукты','Транспорт','Здоровье','Подписки и связь'].includes(cat)};}}
+ return next;
 }
 function savingsAchievements(s,asOf){
  const monthly={};for(const t of s.transactions.filter(t=>!t.fundingKey&&t.date<=asOf&&(t.type==='reserve'||t.type==='release'))){const month=t.date.slice(0,7);monthly[month]=(monthly[month]||0)+(t.type==='reserve'?1:-1)*c(t.amount);}
@@ -132,6 +160,6 @@ function savingsAchievements(s,asOf){
  const completed=Object.entries(s.settings.savingsPlans||{}).filter(([month,plan])=>month<=asOf.slice(0,7)&&c(plan.target)>0&&(monthly[month]||0)>=c(plan.target)).length;
  return {months,completed,total:reserves(s,asOf).savings};
 }
-const api={cash,kind,debt,schedule,reserves,funding,savePayment,removePayment,reserveFunding,setFundingPlan,proposeBudget,acceptBudget,savingsAchievements,key};
+const api={cash,kind,debt,schedule,reserves,funding,savePayment,removePayment,reserveFunding,setFundingPlan,proposeBudget,acceptBudget,budgetKnowledge,isOneOff,oneOffCosts,savingsAchievements,key};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyFinance=api;
 })(globalThis);
