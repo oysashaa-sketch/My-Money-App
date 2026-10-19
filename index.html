@@ -23,16 +23,18 @@
     <main id="main" aria-live="polite"></main>
     <nav class="bottom-nav" aria-label="Основные разделы">
       <button class="tab active" data-page="home"><span>⌂</span><small>Главная</small></button>
-      <button class="tab" data-page="transactions"><span>≡</span><small>Операции</small></button>
+      <button class="tab" data-page="transactions"><span>≡</span><small>История<br>операций</small></button>
       <button class="fab" id="new-operation" aria-label="Добавить операцию">+</button>
       <button class="tab" data-page="goals"><span>◎</span><small>Цели</small></button>
-      <button class="tab" data-page="obligations"><span>▤</span><small>Обязательства</small></button>
+      <button class="tab" data-page="obligations"><span>▤</span><small>Запланированные<br>платежи</small></button>
     </nav>
     <dialog id="modal"><div class="modal-inner"><div class="modal-header"><h2 id="modal-title"></h2><button class="icon-btn" id="close-modal" aria-label="Закрыть">×</button></div><div id="modal-body"></div></div></dialog>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
   </div>
+  <script src="finance.js" defer></script>
   <script src="planner.js" defer></script>
   <script src="planner-ui.js" defer></script>
+  <script src="assistant-ui.js" defer></script>
   <script src="app.js" defer></script>
 </body>
 </html>
