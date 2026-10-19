@@ -1,6 +1,7 @@
 /* My Money 0.3: pure calculations; never writes user data. All money in kopecks. */
 (function(root){
 'use strict';
+const F=root.MoneyFinance||(typeof require==='function'?require('./finance.js'):null);
 const cents=n=>Math.round((Number(n)||0)*100), rub=n=>n/100;
 const iso=d=>`${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 const date=s=>{const [y,m,d]=s.split('-').map(Number);return new Date(y,m-1,d,12)};
@@ -24,26 +25,24 @@ function budgetSummary(state,month,asOf){
  return categories.map(category=>{
   const c=budgetConfig(state.settings,category);
   const purchases=state.transactions.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&(!asOf||t.date<=asOf)&&t.category===category);
-  const actual=purchases.reduce((n,t)=>n+cents(t.amount),0),limit=c.legacyTaxi?0:c.limit;
+  const actual=purchases.reduce((n,t)=>n+cents(t.amount),0),once=cents(F.oneOffCosts(state,month,[category])[category]),limit=c.legacyTaxi?0:c.limit+once;
   const taxiActual=purchases.filter(taxi).reduce((n,t)=>n+cents(t.amount),0);
-  return {...c,limit:rub(limit),estimate:rub(c.estimate),actual:rub(actual),remaining:rub(limit-actual),percent:limit>0?actual/limit*100:null,legacyTaxiBudget:c.legacyTaxi?{limit:rub(c.limit),actual:rub(taxiActual),remaining:rub(c.limit-taxiActual),percent:c.limit>0?taxiActual/c.limit*100:null}:null};
+  return {...c,regularLimit:rub(c.limit),oneOff:rub(once),limit:rub(limit),estimate:rub(c.estimate),actual:rub(actual),remaining:rub(limit-actual),percent:limit>0?actual/limit*100:null,legacyTaxiBudget:c.legacyTaxi?{limit:rub(c.limit),actual:rub(taxiActual),remaining:rub(c.limit-taxiActual),percent:c.limit>0?taxiActual/c.limit*100:null}:null};
  });
 }
-function occurrences(state,to){
- const paid=new Set(state.transactions.filter(t=>t.obligationId&&t.forDue).map(t=>`${t.obligationId}|${t.forDue}`)),out=[];
- for(const o of state.obligations){if(!/^\d{4}-\d{2}-\d{2}$/.test(o.firstDue||''))continue;
-  for(let i=0;;i++){if(o.count&&i>=o.count)break;let due=i===0?o.firstDue:o.frequency==='weekly'?add(o.firstDue,i*7):o.frequency==='biweekly'?add(o.firstDue,i*14):o.frequency==='monthly'?shift(o.firstDue,i):o.frequency==='bimonthly'?shift(o.firstDue,i*2):null;
-   if(!due||due>to)break;if(!paid.has(`${o.id}|${due}`))out.push({...o,due});
-  }
- }return out;
-}
+function occurrences(state,to){return F.schedule(state,to).filter(o=>o.status!=='paid')}
 function forecast(state,from,days=60,purchase=0){
  const to=add(from,days-1),s=state.settings,tx=state.transactions;
- let cash=cents(s.startingBalance)+tx.filter(t=>t.date<=from).reduce((a,t)=>a+effect(t),0),saved=tx.filter(t=>t.date<=from).reduce((a,t)=>a+reserve(t),0);
+ let cash=cents(s.startingBalance)+tx.filter(t=>t.date<=from).reduce((a,t)=>a+effect(t),0),saved=cents(F.reserves(state,from).total);
  cash-=cents(purchase);
+ const pools=Object.fromEntries(Object.entries(F.reserves(state,from).pools).map(([k,v])=>[k,cents(v)]));
  const initialCash=cash,initialFree=cash-saved,events=[],endDate=date(to),monthEnd=iso(new Date(endDate.getFullYear(),endDate.getMonth()+1,0,12)),obs=occurrences(state,monthEnd);
- for(const o of obs.filter(o=>o.due<=to))events.push({date:o.due<from?from:o.due,name:o.name+(o.due<from?' (просрочено)':''),kind:'obligation',delta:-cents(o.amount),reserveDelta:0,order:0});
- for(const t of tx.filter(t=>t.date>from&&t.date<=to))if(effect(t)||reserve(t))events.push({date:t.date,name:t.note||'Внесённая будущая операция',kind:'recorded',delta:effect(t),reserveDelta:reserve(t),order:effect(t)>0?3:1});
+ for(const o of obs.filter(o=>o.due<=to))events.push({date:o.due<from?from:o.due,name:o.name+(o.due<from?' (просрочено)':''),kind:'obligation',delta:-cents(o.amount),reserveDelta:0,consumePool:F.key(o.id,o.due),order:0});
+ for(const t of tx.filter(t=>t.date>from&&t.date<=to))if(effect(t)||reserve(t))events.push({date:t.date,name:t.note||'Внесённая будущая операция',kind:'recorded',delta:effect(t),reserveDelta:reserve(t),poolKey:t.fundingKey,poolDelta:t.fundingKey?reserve(t):0,consumePool:t.useFunding&&t.obligationId?F.key(t.obligationId,t.forDue):null,order:effect(t)>0?3:1});
+ for(const o of state.obligations)for(const p of o.fundingPlan||[]){
+  if(p.date>from&&p.date<=to&&!tx.some(t=>t.fundingPlanId===p.id)&&occurrences(state,p.forDue).some(x=>x.id===o.id&&x.due===p.forDue))
+   events.push({date:p.date,name:`План резерва: ${o.name} (не расход)`,kind:'funding',delta:0,reserveDelta:cents(p.amount),poolKey:F.key(o.id,p.forDue),poolDelta:cents(p.amount),order:5});
+ }
  // A manually scheduled income replaces the estimated salary on that date.
  for(const p of paydays(from,to))if(!tx.some(t=>t.type==='income'&&t.date===p))events.push({date:p,name:'Ожидаемая зарплата (только прогноз)',kind:'salary',delta:Number(p.slice(8))<=5?Math.floor(cents(s.salary)/2):cents(s.salary)-Math.floor(cents(s.salary)/2),reserveDelta:0,order:4});
  const monthly=new Map();
@@ -53,8 +52,8 @@ function forecast(state,from,days=60,purchase=0){
    let total=0;
    for(const category of categories){
     const config=budgetConfig(s,category);
-    const spent=tx.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&matches(t,config)).reduce((a,t)=>a+cents(t.amount),0);
-    const planned=obs.filter(o=>o.type!=='debt'&&o.due.slice(0,7)===month&&matches(o,config)).reduce((a,o)=>a+cents(o.amount),0);
+    const spent=tx.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&matches(t,config)&&!F.isOneOff(state,t)).reduce((a,t)=>a+cents(t.amount),0);
+    const planned=obs.filter(o=>o.type!=='debt'&&!F.isOneOff(state,o)&&o.due.slice(0,7)===month&&matches(o,config)).reduce((a,o)=>a+cents(o.amount),0);
     total+=Math.max(0,config.estimate-spent-planned);
    }
    total+=cents(s.otherDaily)*count;
@@ -65,14 +64,14 @@ function forecast(state,from,days=60,purchase=0){
  }
  events.sort((a,b)=>a.date.localeCompare(b.date)||a.order-b.order);
  let minimum=initialFree,minDate=from,firstDeficitDate=initialFree<0?from:null;
- for(const e of events){cash+=e.delta;saved+=e.reserveDelta;e.cash=rub(cash);e.free=rub(cash-saved);e.amount=rub(e.delta);if(cash-saved<0&&!firstDeficitDate)firstDeficitDate=e.date;if(cash-saved<minimum){minimum=cash-saved;minDate=e.date}}
- const target=Math.max(0,cents(s.savingsTarget)-tx.filter(t=>t.date<=from&&t.date.slice(0,7)===from.slice(0,7)).reduce((a,t)=>a+reserve(t),0));
- return {from,to,events,firstDeficitDate,maxDeficitDate:minimum<0?minDate:null,conservative:categories.some(c=>{const b=budgetConfig(s,c);return b.conservative&&b.estimate>0}),initialCash:rub(initialCash),initialFree:rub(initialFree),minimum:rub(minimum),minDate,end:rub(cash-saved),savingsRemaining:rub(target),available:rub(Math.max(0,minimum-target)),missingBasics:categories.some(c=>budgetConfig(s,c).estimate===0)};
+ for(const e of events){if(e.consumePool){const use=Math.min(Math.max(0,pools[e.consumePool]||0),Math.max(0,-e.delta));e.reserveDelta-=use;pools[e.consumePool]=(pools[e.consumePool]||0)-use;}if(e.poolKey)pools[e.poolKey]=(pools[e.poolKey]||0)+(e.poolDelta||0);cash+=e.delta;saved+=e.reserveDelta;e.cash=rub(cash);e.free=rub(cash-saved);e.amount=rub(e.delta);if(cash-saved<0&&!firstDeficitDate)firstDeficitDate=e.date;if(cash-saved<minimum){minimum=cash-saved;minDate=e.date}}
+ const target=Math.max(0,cents(s.savingsPlans?.[from.slice(0,7)]?.target??s.savingsTarget)-tx.filter(t=>!t.fundingKey&&t.date<=from&&t.date.slice(0,7)===from.slice(0,7)).reduce((a,t)=>a+reserve(t),0));
+ return {from,to,events,budgetIncomplete:F.budgetKnowledge(state,from,categories).missing.length>0,firstDeficitDate,maxDeficitDate:minimum<0?minDate:null,conservative:categories.some(c=>{const b=budgetConfig(s,c);return b.conservative&&b.estimate>0}),initialCash:rub(initialCash),initialFree:rub(initialFree),minimum:rub(minimum),minDate,end:rub(cash-saved),savingsRemaining:rub(target),available:rub(Math.max(0,minimum-target)),missingBasics:categories.some(c=>budgetConfig(s,c).estimate===0)};
 }
 function allocation(state,from){
  const f=forecast(state,from),next=paydays(from,add(from,40))[0];
- const required=(kind)=>-f.events.filter(e=>e.date<=next&&e.kind===kind&&e.amount<0).reduce((a,e)=>a+cents(e.amount),0);
- const mandatory=required('obligation')+required('recorded'),living=required('living');
+ const required=(kind)=>-f.events.filter(e=>e.date<=next&&e.kind===kind&&e.amount<0).reduce((a,e)=>a+cents(e.amount)-Math.min(0,e.reserveDelta||0),0);
+ const mandatory=required('obligation')+required('recorded')+f.events.filter(e=>e.kind==='funding'&&e.date<=next).reduce((n,e)=>n+e.reserveDelta,0),living=required('living');
  const funds=Math.max(0,cents(f.initialFree)),needs=mandatory+living,headroom=Math.max(0,cents(f.minimum));
  const futureReserve=Math.max(0,funds-needs-headroom),desired=cents(f.savingsRemaining);
  const savings=Math.min(desired,headroom,Math.max(0,funds-needs-futureReserve));
@@ -94,11 +93,12 @@ function purchaseContext(state,from,input){
  if(urgency==='need')recommendations.push('Покупка отмечена как необходимая. Ниже показаны её финансовые последствия; решение остаётся за тобой, автоматического запрета нет.');
  else if(urgency==='canwait')recommendations.push('Покупку можно отложить: сравни её стоимость с доступной суммой и оставшимся бюджетом.');
  const config=budgetConfig(state.settings,input.category),item={category:input.category,merchant:input.merchant||''};
- const configured=Object.hasOwn(state.settings.categoryBudgets||{},input.category)||config.limit>0;
+ const monthlyLimit=config.limit+cents(F.oneOffCosts(state,from.slice(0,7),[input.category])[input.category]);
+ const configured=Object.hasOwn(state.settings.categoryBudgets||{},input.category)||monthlyLimit>0;
  const applicable=configured&&(!config.legacyTaxi||taxi(item)),budgetScope={...config,taxiOnly:config.legacyTaxi};
  const actual=state.transactions.filter(t=>t.type==='expense'&&t.date<=from&&t.date.slice(0,7)===from.slice(0,7)&&matches(t,budgetScope)).reduce((n,t)=>n+cents(t.amount),0);
- const after=actual+nonnegative(input.amount),over=applicable?Math.max(0,after-config.limit):0;
- return {urgency,recommendations,deliveries:deliveryHistory(state,from),budget:{configured:applicable,taxiOnly:config.legacyTaxi,limit:rub(config.limit),actual:rub(actual),after:rub(after),overage:rub(over),additionalOverage:rub(Math.max(0,over-Math.max(0,actual-config.limit)))}};
+ const after=actual+nonnegative(input.amount),over=applicable?Math.max(0,after-monthlyLimit):0;
+ return {urgency,recommendations,deliveries:deliveryHistory(state,from),budget:{configured:applicable,taxiOnly:config.legacyTaxi,limit:rub(monthlyLimit),actual:rub(actual),after:rub(after),overage:rub(over),additionalOverage:rub(Math.max(0,over-Math.max(0,actual-monthlyLimit)))}};
 }
 const api={forecast,allocation,paydays,occurrences,add,categories,budgetConfig,budgetSummary,deliveryHistory,purchaseContext};if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyPlanner=api;
 })(globalThis);
