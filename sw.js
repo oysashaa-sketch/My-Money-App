@@ -1,4 +1,4 @@
-const CACHE='my-money-v04-simple-20261021-1';
+const CACHE='my-money-v04-simple-20261021-2';
 const ASSETS=['./','./index.html','./style.css','./finance.js','./assistant-ui.js','./planner.js','./planner-ui.js','./app.js','./manifest.webmanifest','./icons/icon.svg','./icons/icon-180.png','./icons/icon-192.png','./icons/icon-512.png'];
 // Waiting worker activates after old clients close, avoiding mixed versions in an open app.
 self.addEventListener('install',e=>e.waitUntil(caches.open(CACHE).then(c=>c.addAll(ASSETS))));

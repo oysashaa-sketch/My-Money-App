@@ -55,7 +55,7 @@ test('closed payment calendar is one subdued clickable row with actual sum and n
  const h=screen(put(sample()));const html=h.run('renderPaymentCalendar()'),row=html.match(/<button class="settled-payment"[\s\S]*?<\/button>/)[0];assert.ok(row.includes('<s>Synthetic payment</s>'));assert.ok(row.includes('<s class="number">15'));assert.ok(!row.includes('Внесено'));assert.ok(!row.includes('Осталось'));assert.ok(!row.includes('Оплачено'));assert.ok(row.includes('closed-payment'));
 });
 test('history separates savings contributions from payment reserves and uses compact month arrows',()=>{
- const s=sample();s.transactions=[{id:'a',type:'reserve',amount:100,date:day},{id:'b',type:'reserve',amount:200,date:day,fundingKey:'bill|'+day}];const h=screen(s);h.run('monthFilter="2026-10"');const html=h.run('renderTransactions()');assert.ok(html.includes('month-prev'));assert.ok(html.includes('month-next'));assert.ok(html.includes('Накопления на цели'));assert.ok(html.includes('В резервы платежей'));assert.ok(html.includes('Расходы'));assert.ok(!html.includes('Потребление'));
+ const s=sample();s.transactions=[{id:'a',type:'reserve',amount:100,date:day},{id:'b',type:'reserve',amount:200,date:day,fundingKey:'bill|'+day}];const h=screen(s);h.run('monthFilter="2026-10"');const html=h.run('renderTransactions()');assert.ok(html.includes('month-prev'));assert.ok(html.includes('month-next'));assert.ok(html.includes('Накопления на цели'));assert.ok(html.includes('Создано резервов за месяц'));assert.ok(html.includes('Расходы'));assert.ok(!html.includes('Потребление'));
 });
 test('v0.3 partial records remain byte-identical at load; new optional closure data round-trips in JSON',()=>{
  const s=sample();s.transactions=[{id:'old',type:'expense',method:'cash',amount:6100,date:day,obligationId:'bill',forDue:day,custom:'keep'}];const h=screen(s);h.run('render();showClosedPayment("bill|2026-10-21")');assert.equal(h.writes(),0);assert.deepEqual(h.data(),s);
@@ -69,4 +69,47 @@ test('editing any part of a manually closed multi-part payment keeps the occurre
 });
 test('clearing the month selector keeps a valid current period instead of corrupting arrows',()=>{
  const h=screen(sample());h.run('monthFilter="2026-10"');const target={id:'month-filter',value:''};for(const handler of h.events.change)handler({target});assert.equal(h.run('monthFilter'),'2026-10');assert.equal(target.value,'2026-10');
+});
+test('active reserve history uses linked purpose, shows its remainder, and never writes financial records',()=>{
+ const s=fund(sample()),before=JSON.stringify(s);s.obligations[0].name='Операция <тест>';
+ const h=screen(s),details=JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()))'));
+ assert.deepEqual(details.reserve,{used:0,released:0,remaining:20000});
+ const html=h.run('monthFilter="2026-10";renderTransactions()');assert.ok(html.includes('Резерв: Операция &lt;тест&gt;'));assert.ok(html.includes('Осталось в резерве '+h.run('fmt(20000)')));
+ assert.equal(h.writes(),0);assert.deepEqual(h.data(),s);assert.equal(F.cash(s,day),56290);assert.equal(F.freeNow(s,day),36290);assert.equal(JSON.parse(before).transactions.length,s.transactions.length);
+});
+test('partial payments are attributed FIFO across contributions without repeating used money',()=>{
+ let s=sample();s=fund(s,10000);s=F.reserveFunding(s,{obligationId:'bill',forDue:day,amount:10000,newId:'reserve2'},day);
+ s=put(s,{amount:6000,finalPayment:false});s=put(s,{newId:'pay2',commandId:'cmd2',amount:4000,finalPayment:false});
+ const h=screen(s),details=JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()))'));
+ assert.deepEqual(details.reserve,{used:10000,released:0,remaining:0});assert.deepEqual(details.reserve2,{used:0,released:0,remaining:10000});
+ assert.equal(Object.values(details).reduce((n,x)=>n+x.used,0),Object.values(F.reserves(s,day).used).reduce((a,b)=>a+b,0));
+ assert.ok(h.run('txnRow(state.transactions.find(t=>t.id==="reserve2"),historyReserveDetails(state,today()).reserve2)').includes('Осталось в резерве '+h.run('fmt(10000)')));
+});
+test('closed reserve history splits use and release once, with one actual debit and no new records',()=>{
+ const s=put(fund(sample())),before=JSON.stringify(s),h=screen(s);
+ const details=JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()))'));assert.deepEqual(details.reserve,{used:15000,released:5000,remaining:0});
+ const html=h.run('renderTransactions()');assert.ok(html.includes('Использовано '+h.run('fmt(15000)')+' · Освобождено '+h.run('fmt(5000)')));
+ assert.equal(JSON.stringify(h.data()),before);assert.equal(h.writes(),0);assert.equal(F.cash(h.data(),day),41290);assert.equal(F.freeNow(h.data(),day),41290);assert.equal(h.data().transactions.length,2);
+});
+test('several reserve contributions and final partial settlement conserve created, used and released totals',()=>{
+ let s=fund(sample(),10000);s=put(s,{amount:5000,finalPayment:false});s=F.reserveFunding(s,{obligationId:'bill',forDue:day,amount:10000,newId:'reserve2'},day);s=put(s,{newId:'p2',commandId:'c2',amount:10000});
+ const h=screen(s),details=JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()))'));
+ assert.deepEqual(details.reserve,{used:10000,released:0,remaining:0});assert.deepEqual(details.reserve2,{used:5000,released:5000,remaining:0});
+ assert.equal(Object.values(details).reduce((n,x)=>n+x.used+x.released+x.remaining,0),20000);
+});
+test('monthly created reserve total is gross contributions, not net releases or current remainder',()=>{
+ const s=sample();s.transactions=[{id:'prior',type:'reserve',fundingKey:'bill|'+day,date:'2026-09-30',amount:3000},{id:'current',type:'reserve',fundingKey:'bill|'+day,date:day,amount:10000},{id:'release',type:'release',fundingKey:'bill|'+day,date:day,amount:5000},{id:'savings',type:'reserve',date:day,amount:777},{id:'future',type:'reserve',fundingKey:'bill|'+day,date:'2026-11-01',amount:2000}];
+ const h=screen(s),html=h.run('monthFilter="2026-10";renderTransactions()');assert.ok(html.includes('Создано резервов за месяц</div><b class="mid number">'+h.run('fmt(10000)')));assert.equal(F.reserves(s,day).pools['bill|'+day],8000);
+ const details=JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()))'));assert.deepEqual(details.prior,{used:0,released:3000,remaining:0});assert.deepEqual(details.current,{used:0,released:2000,remaining:8000});assert.equal(details.future,undefined);
+});
+test('history reserve details follow reopen, edit and delete using current financial derivations',()=>{
+ let s=put(fund(sample()));s=F.setOccurrenceClosed(s,'bill',day,false,day);
+ let h=screen(s);assert.deepEqual(JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()).reserve)')),{used:15000,released:0,remaining:5000});
+ s=put(s,{id:'pay',amount:12000,finalPayment:false});h=screen(s);assert.deepEqual(JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()).reserve)')),{used:12000,released:0,remaining:8000});
+ s=F.removePayment(s,'pay');h=screen(s);assert.deepEqual(JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()).reserve)')),{used:0,released:0,remaining:20000});
+});
+test('reserve attribution isolates recurring dates, missing obligations and legacy metadata',()=>{
+ const s=sample();s.obligations[0].frequency='monthly';s.transactions=[{id:'old',type:'reserve',date:day,amount:10,fundingKey:'missing|'+day,note:'Legacy reserve',custom:{keep:true}},{id:'first',type:'reserve',date:day,amount:100,fundingKey:'bill|'+day},{id:'next',type:'reserve',date:day,amount:200,fundingKey:'bill|2026-11-21'}];
+ const paid=put(s,{amount:50}),h=screen(paid),before=JSON.stringify(paid);h.run('renderTransactions()');
+ const details=JSON.parse(h.run('JSON.stringify(historyReserveDetails(state,today()))'));assert.deepEqual(details.first,{used:50,released:50,remaining:0});assert.deepEqual(details.next,{used:0,released:0,remaining:200});assert.deepEqual(details.old,{used:0,released:0,remaining:10});assert.equal(JSON.stringify(h.data()),before);assert.equal(h.writes(),0);
 });
