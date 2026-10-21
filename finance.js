@@ -35,8 +35,8 @@ function schedule(s,until,asOf='9999-12-31'){
    const due=i===0?o.firstDue:o.frequency==='weekly'?add(o.firstDue,i*7):o.frequency==='biweekly'?add(o.firstDue,i*14):o.frequency==='monthly'?shift(o.firstDue,i):o.frequency==='bimonthly'?shift(o.firstDue,i*2):null;
    if(!due||due>until)break;
    const payments=s.transactions.filter(t=>t.obligationId===o.id&&t.forDue===due&&isCash(t)&&t.date<=asOf);
-   const paid=payments.reduce((n,t)=>n+c(t.amount),0),remaining=Math.max(0,c(o.amount)-paid);
-   out.push({...o,due,occId:key(o.id,due),total:Number(o.amount),paid:r(paid),amount:r(remaining),status:remaining===0?'paid':paid>0?'partial':'unpaid'});
+   const paid=payments.reduce((n,t)=>n+c(t.amount),0),closure=s.paymentClosures?.[key(o.id,due)],final=paid>0&&(closure&&(!closure.transactionId||payments.some(t=>t.id===closure.transactionId))?closure.closed===true&&closure.date<=asOf:payments.some(t=>t.finalPayment===true)),remaining=final?0:Math.max(0,c(o.amount)-paid);
+   out.push({...o,due,occId:key(o.id,due),total:Number(o.amount),paid:r(paid),final,savings:final?r(Math.max(0,c(o.amount)-paid)):0,amount:r(remaining),status:remaining===0?'paid':paid>0?'partial':'unpaid'});
   }
  }return out.sort((a,b)=>a.due.localeCompare(b.due));
 }
@@ -50,6 +50,7 @@ function reserves(s,asOf){
    const k=key(t.obligationId,t.forDue),use=Math.min(Math.max(0,pools[k]||0),c(t.amount));pools[k]=(pools[k]||0)-use;used[t.id]=r(use);
   }
  }
+ for(const k of Object.keys(pools)){const [id,due]=k.split('|');const item=schedule(s,due,asOf).find(o=>o.id===id&&o.due===due);if(item?.status==='paid')pools[k]=0;}
  return {savings:r(savings),pools:Object.fromEntries(Object.entries(pools).map(([k,v])=>[k,r(Math.max(0,v))])),used,total:r(savings+Object.values(pools).reduce((n,v)=>n+Math.max(0,v),0))};
 }
 function funding(s,id,due,asOf){
@@ -73,14 +74,25 @@ function savePayment(s,input){
  const d=next.debts.find(d=>d.id===debtId);
  const type=o?.type==='debt'||!o&&debtId?'debt_payment':'expense';
  if(type==='debt_payment'&&!d&&!o)throw Error('Выбери кредитную карту или Сплит');
- const tx={...existing,id:existing?.id||input.newId,commandId:existing?.commandId||input.commandId,type,method:'cash',amount:r(c(amount)),date:input.date,debtId,category:o?.category||existing?.category||'Другое',note:input.note||o?.name||'Платёж по долгу',createdAt:existing?.createdAt||input.createdAt||Date.now(),paymentModel:'bank-v1',useFunding:!!o};
+ const tx={...existing,id:existing?.id||input.newId,commandId:existing?.commandId||input.commandId,type,method:'cash',amount:r(c(amount)),date:input.date,debtId,category:o?.category||existing?.category||'Другое',note:input.note!==undefined?String(input.note):o?.name||'Платёж по долгу',createdAt:existing?.createdAt||input.createdAt||Date.now(),paymentModel:'bank-v1',useFunding:!!o};
  if(!tx.id)throw Error('Нет идентификатора операции');
  if(o){tx.obligationId=o.id;tx.forDue=input.forDue}else {delete tx.obligationId;delete tx.forDue;}
  if(input.bankBalance!==undefined&&input.bankBalance!==null&&input.bankBalance!==''){
   if(!d)throw Error('Для сверки выбери кредитную карту');const bank=Number(input.bankBalance);if(!Number.isFinite(bank)||bank<0)throw Error('Остаток банка должен быть неотрицательным');tx.bankBalance=r(c(bank));
  }else delete tx.bankBalance;
+ if(input.finalPayment!==undefined&&o){tx.finalPayment=input.finalPayment===true;next.paymentClosures={...next.paymentClosures,[key(o.id,input.forDue)]:{closed:tx.finalPayment,date:tx.date,transactionId:tx.id}};}
  if(existing)next.transactions[next.transactions.findIndex(t=>t.id===existing.id)]=tx;else next.transactions.push(tx);
  return {state:next,transaction:tx,duplicate:false};
+}
+function setOccurrenceClosed(s,id,due,closed,asOf){
+ const next=structuredClone(s),item=schedule(s,due,asOf).find(o=>o.id===id&&o.due===due);
+ if(!item||item.paid<=0)throw Error('Сначала внеси фактическую оплату');
+ const k=key(id,due);if(next.paymentClosures?.[k]?.closed===closed)return next;
+ next.paymentClosures={...next.paymentClosures,[k]:{closed:!!closed,date:asOf}};return next;
+}
+function freeNow(s,asOf){return r(c(cash(s,asOf))-c(reserves(s,asOf).total))}
+function categoryActual(s,month,categories,asOf='9999-12-31'){
+ const sums=Object.fromEntries(categories.map(cat=>[cat,0]));for(const t of s.transactions.filter(t=>(t.type==='expense'||t.type==='debt_interest')&&t.date.slice(0,7)===month&&t.date<=asOf)){const cat=Object.hasOwn(sums,t.category)?t.category:'Другое';sums[cat]+=c(t.amount);}return Object.fromEntries(Object.entries(sums).map(([cat,sum])=>[cat,r(sum)]));
 }
 function removePayment(s,id){const next=structuredClone(s);next.transactions=next.transactions.filter(t=>t.id!==id);return next}
 function reserveFunding(s,input,asOf){
@@ -160,6 +172,6 @@ function savingsAchievements(s,asOf){
  const completed=Object.entries(s.settings.savingsPlans||{}).filter(([month,plan])=>month<=asOf.slice(0,7)&&c(plan.target)>0&&(monthly[month]||0)>=c(plan.target)).length;
  return {months,completed,total:reserves(s,asOf).savings};
 }
-const api={cash,kind,debt,schedule,reserves,funding,savePayment,removePayment,reserveFunding,setFundingPlan,proposeBudget,acceptBudget,budgetKnowledge,isOneOff,oneOffCosts,savingsAchievements,key};
+const api={cash,freeNow,categoryActual,kind,debt,schedule,reserves,setOccurrenceClosed,funding,savePayment,removePayment,reserveFunding,setFundingPlan,proposeBudget,acceptBudget,budgetKnowledge,isOneOff,oneOffCosts,savingsAchievements,key};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;else root.MoneyFinance=api;
 })(globalThis);

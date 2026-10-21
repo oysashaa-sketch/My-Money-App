@@ -12,12 +12,12 @@
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml">
   <link rel="apple-touch-icon" href="icons/icon-180.png">
   <link rel="stylesheet" href="style.css">
-  <title>My Money 0.3 · мой финансовый помощник</title>
+  <title>My Money 0.4 · Simple Money</title>
 </head>
 <body>
   <div id="app">
     <header class="topbar">
-      <div><div class="eyebrow">МОЙ ФИНАНСОВЫЙ НАВИГАТОР</div><h1 id="header-title">Главная</h1></div>
+      <div><div class="eyebrow">Simple Money · каждый день</div><h1 id="header-title" class="brand-title">My Money</h1></div>
       <button id="open-settings" class="icon-btn" aria-label="Настройки">⚙</button>
     </header>
     <main id="main" aria-live="polite"></main>
@@ -26,7 +26,7 @@
       <button class="tab" data-page="transactions"><span>≡</span><small>История<br>операций</small></button>
       <button class="fab" id="new-operation" aria-label="Добавить операцию">+</button>
       <button class="tab" data-page="goals"><span>◎</span><small>Цели</small></button>
-      <button class="tab" data-page="obligations"><span>▤</span><small>Запланированные<br>платежи</small></button>
+      <button class="tab" data-page="obligations" aria-label="Запланированные платежи"><span>▤</span><small>Платежи</small></button>
     </nav>
     <dialog id="modal"><div class="modal-inner"><div class="modal-header"><h2 id="modal-title"></h2><button class="icon-btn" id="close-modal" aria-label="Закрыть">×</button></div><div id="modal-body"></div></div></dialog>
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
