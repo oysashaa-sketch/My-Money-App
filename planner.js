@@ -1,4 +1,4 @@
-/* My Money 0.3: pure calculations; never writes user data. All money in kopecks. */
+/* My Money 0.4: pure calculations; never writes user data. All money in kopecks. */
 (function(root){
 'use strict';
 const F=root.MoneyFinance||(typeof require==='function'?require('./finance.js'):null);
@@ -38,7 +38,7 @@ function forecast(state,from,days=60,purchase=0){
  const pools=Object.fromEntries(Object.entries(F.reserves(state,from).pools).map(([k,v])=>[k,cents(v)]));
  const initialCash=cash,initialFree=cash-saved,events=[],endDate=date(to),monthEnd=iso(new Date(endDate.getFullYear(),endDate.getMonth()+1,0,12)),obs=occurrences(state,monthEnd);
  for(const o of obs.filter(o=>o.due<=to))events.push({date:o.due<from?from:o.due,name:o.name+(o.due<from?' (просрочено)':''),kind:'obligation',delta:-cents(o.amount),reserveDelta:0,consumePool:F.key(o.id,o.due),order:0});
- for(const t of tx.filter(t=>t.date>from&&t.date<=to))if(effect(t)||reserve(t))events.push({date:t.date,name:t.note||'Внесённая будущая операция',kind:'recorded',delta:effect(t),reserveDelta:reserve(t),poolKey:t.fundingKey,poolDelta:t.fundingKey?reserve(t):0,consumePool:t.useFunding&&t.obligationId?F.key(t.obligationId,t.forDue):null,order:effect(t)>0?3:1});
+ for(const t of tx.filter(t=>t.date>from&&t.date<=to))if(effect(t)||reserve(t))events.push({date:t.date,name:t.note||'Внесённая будущая операция',kind:'recorded',delta:effect(t),reserveDelta:reserve(t),poolKey:t.fundingKey,poolDelta:t.fundingKey?reserve(t):0,consumePool:t.useFunding&&t.obligationId?F.key(t.obligationId,t.forDue):null,finalClose:t.finalPayment===true,order:effect(t)>0?3:1});
  for(const o of state.obligations)for(const p of o.fundingPlan||[]){
   if(p.date>from&&p.date<=to&&!tx.some(t=>t.fundingPlanId===p.id)&&occurrences(state,p.forDue).some(x=>x.id===o.id&&x.due===p.forDue))
    events.push({date:p.date,name:`План резерва: ${o.name} (не расход)`,kind:'funding',delta:0,reserveDelta:cents(p.amount),poolKey:F.key(o.id,p.forDue),poolDelta:cents(p.amount),order:5});
@@ -54,7 +54,8 @@ function forecast(state,from,days=60,purchase=0){
     const config=budgetConfig(s,category);
     const spent=tx.filter(t=>t.type==='expense'&&t.date.slice(0,7)===month&&matches(t,config)&&!F.isOneOff(state,t)).reduce((a,t)=>a+cents(t.amount),0);
     const planned=obs.filter(o=>o.type!=='debt'&&!F.isOneOff(state,o)&&o.due.slice(0,7)===month&&matches(o,config)).reduce((a,o)=>a+cents(o.amount),0);
-    total+=Math.max(0,config.estimate-spent-planned);
+    const savedByClosure=F.schedule(state,monthEnd).filter(o=>o.final&&o.type!=='debt'&&!F.isOneOff(state,o)&&o.due.slice(0,7)===month&&matches(o,config)).reduce((n,o)=>n+cents(o.savings),0);
+    total+=Math.max(0,config.estimate-spent-planned-savedByClosure);
    }
    total+=cents(s.otherDaily)*count;
    monthly.set(month,{total,count,index:0});
@@ -64,7 +65,7 @@ function forecast(state,from,days=60,purchase=0){
  }
  events.sort((a,b)=>a.date.localeCompare(b.date)||a.order-b.order);
  let minimum=initialFree,minDate=from,firstDeficitDate=initialFree<0?from:null;
- for(const e of events){if(e.consumePool){const use=Math.min(Math.max(0,pools[e.consumePool]||0),Math.max(0,-e.delta));e.reserveDelta-=use;pools[e.consumePool]=(pools[e.consumePool]||0)-use;}if(e.poolKey)pools[e.poolKey]=(pools[e.poolKey]||0)+(e.poolDelta||0);cash+=e.delta;saved+=e.reserveDelta;e.cash=rub(cash);e.free=rub(cash-saved);e.amount=rub(e.delta);if(cash-saved<0&&!firstDeficitDate)firstDeficitDate=e.date;if(cash-saved<minimum){minimum=cash-saved;minDate=e.date}}
+ for(const e of events){if(e.consumePool){const use=Math.min(Math.max(0,pools[e.consumePool]||0),Math.max(0,-e.delta));e.reserveDelta-=use;pools[e.consumePool]=(pools[e.consumePool]||0)-use;if(e.finalClose){e.reserveDelta-=Math.max(0,pools[e.consumePool]);pools[e.consumePool]=0;}}if(e.poolKey)pools[e.poolKey]=(pools[e.poolKey]||0)+(e.poolDelta||0);cash+=e.delta;saved+=e.reserveDelta;e.cash=rub(cash);e.free=rub(cash-saved);e.amount=rub(e.delta);if(cash-saved<0&&!firstDeficitDate)firstDeficitDate=e.date;if(cash-saved<minimum){minimum=cash-saved;minDate=e.date}}
  const target=Math.max(0,cents(s.savingsPlans?.[from.slice(0,7)]?.target??s.savingsTarget)-tx.filter(t=>!t.fundingKey&&t.date<=from&&t.date.slice(0,7)===from.slice(0,7)).reduce((a,t)=>a+reserve(t),0));
  return {from,to,events,budgetIncomplete:F.budgetKnowledge(state,from,categories).missing.length>0,firstDeficitDate,maxDeficitDate:minimum<0?minDate:null,conservative:categories.some(c=>{const b=budgetConfig(s,c);return b.conservative&&b.estimate>0}),initialCash:rub(initialCash),initialFree:rub(initialFree),minimum:rub(minimum),minDate,end:rub(cash-saved),savingsRemaining:rub(target),available:rub(Math.max(0,minimum-target)),missingBasics:categories.some(c=>budgetConfig(s,c).estimate===0)};
 }

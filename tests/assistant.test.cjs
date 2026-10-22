@@ -112,8 +112,8 @@ test('budget cannot hide required monthly deficit or promise unaffordable saving
 test('all simplified views preserve old v0.3 JSON byte-for-byte on load and include mobile navigation',()=>{
  const s=fixture();s.transactions=[{id:'legacy',type:'expense',method:'cash',date:day,amount:5,custom:'keep'}];s.goals=[{id:'goal',name:'Synthetic goal',target:50}];s.obligations=[bill({frequency:'weekly',custom:'keep'})];s.settings.custom={keep:true};const raw=JSON.stringify(s),h=ui(s);
  h.run('render();showUnifiedPayment({debtId:"card"});showFunding("o|2026-10-20");showBudgetProposal();showAllocation();renderMyBudget();renderDebtScreen()');assert.equal(h.writes(),0);assert.equal(JSON.stringify(h.snapshot()),raw);
- const home=h.run('renderAssistantHome()');assert.ok(!home.includes('class="budgetline"'));assert.ok(home.includes('Мой бюджет'));assert.ok(home.includes('Ближайшие платежи'));assert.ok(home.includes('<details'));assert.ok(home.includes('Проверить покупку'));
- const html=fs.readFileSync(path.join(__dirname,'..','index.html'),'utf8'),css=fs.readFileSync(path.join(__dirname,'..','style.css'),'utf8');assert.ok(html.includes('width=device-width'));assert.ok(html.includes('Запланированные<br>платежи'));assert.ok(html.includes('История<br>операций'));assert.ok(css.includes('safe-area-inset-bottom'));assert.ok(css.includes('@media(max-width:390px)'));assert.ok(css.includes('min-width:0'));
+ const home=h.run('renderAssistantHome()');assert.ok(!home.includes('class="budgetline"'));assert.ok(home.includes('Расходы по категориям'));assert.ok(home.includes('Свободно сейчас'));assert.ok(home.includes('<details'));assert.ok(home.includes('Проверить покупку'));
+ const html=fs.readFileSync(path.join(__dirname,'..','index.html'),'utf8'),css=fs.readFileSync(path.join(__dirname,'..','style.css'),'utf8');assert.ok(html.includes('width=device-width'));assert.ok(html.includes('aria-label="Запланированные платежи"'));assert.ok(html.includes('История<br>операций'));assert.ok(css.includes('safe-area-inset-bottom'));assert.ok(css.includes('@media(max-width:390px)'));assert.ok(css.includes('min-width:0'));
 });
 test('new payment persistence failure rolls back all changes and leaves records untouched',()=>{
  const s=fixture(),h=ui(s);h.run('localStorage.setItem=()=>{throw Error("full")};');h.ctx.input={amount:100,date:day,debtId:'card'};h.run('submitUnifiedPayment({dataset:{command:"fail"}},{get:k=>input[k]??""})');assert.deepEqual(h.snapshot(),s);
@@ -150,7 +150,7 @@ test('real payment and protected funding affect disposable budget without touchi
 });
 test('editing a funded linked payment through shared UI updates status and keeps history IDs',()=>{
  let s=fixture();s.obligations=[bill({type:'bill',debtId:'',amount:100,frequency:'once'})];s=F.reserveFunding(s,{obligationId:'o',forDue:'2026-10-20',amount:100,newId:'pool'},day);s=pay(s,{amount:100,debtId:'',obligationId:'o',forDue:'2026-10-20'}).state;
- const h=ui(s);h.ctx.input={amount:40,date:day,debtId:'',occurrence:'o|2026-10-20'};h.run('submitUnifiedPayment({dataset:{id:"tx",command:"command"}},{get:k=>input[k]??""})');
+ const h=ui(s);h.ctx.input={amount:40,date:day,debtId:'',occurrence:'o|2026-10-20',finalPayment:'no'};h.run('submitUnifiedPayment({dataset:{id:"tx",command:"command"}},{get:k=>input[k]??""})');
  assert.equal(h.snapshot().transactions.find(t=>t.id==='tx').amount,40);assert.equal(F.schedule(h.snapshot(),'2026-10-20')[0].status,'partial');assert.equal(F.reserves(h.snapshot(),day).pools['o|2026-10-20'],60);
  h.run('deleteItem("transaction","tx")');assert.equal(F.schedule(h.snapshot(),'2026-10-20')[0].status,'unpaid');assert.equal(F.reserves(h.snapshot(),day).pools['o|2026-10-20'],100);
 });
@@ -211,9 +211,9 @@ test('unknown values stay absent on acceptance; explicit user zero is confirmed 
  const out=F.acceptBudget(s,p.limits,P.categories);assert.ok(!Object.hasOwn(out.settings.categoryBudgets,'Продукты'));assert.equal(out.settings.categoryBudgets['Красота'],0);assert.ok(F.budgetKnowledge(out,day,P.categories).missing.includes('Красота'));
  const yes=F.acceptBudget(s,{'Красота':0},P.categories);assert.ok(!F.budgetKnowledge(yes,day,P.categories).missing.includes('Красота'));
 });
-test('incomplete budget hides safe-spending claims on home and purchase check',()=>{
+test('optional limits do not block free cash or the known-obligation purchase check',()=>{
  const s=fixture();s.settings.startingBalance=500000;s.settings.salary=240000;const h=ui(s);h.run('render();smartPurchaseResult({get:k=>({amount:10,category:"Красота",urgency:"canwait",delivery:"no"})[k]})');
- assert.ok(h.element('main').innerHTML.includes('Не подтверждено'));assert.ok(h.element('purchase-result').innerHTML.includes('безопасность покупки не подтверждена'));assert.ok(!h.element('purchase-result').innerHTML.includes('✓ Покупка укладывается'));assert.equal(h.writes(),0);
+ assert.ok(h.element('main').innerHTML.includes('Свободно сейчас'));assert.ok(h.element('purchase-result').innerHTML.includes('отсутствие лимита не означает нулевые расходы'));assert.ok(!h.element('purchase-result').innerHTML.includes('✓ Покупка укладывается'));assert.equal(h.writes(),0);
 });
 test('compact proposal starts with totals and has collapsed categories rather than an open zero form',()=>{
  const h=ui(fixture());h.run('showBudgetProposal({},true)');const html=h.element('modal-body').innerHTML;assert.ok(html.indexOf('Предложено в накопления')<html.indexOf('proposal-0'));assert.ok(html.includes('<details><summary>Раскрыть и изменить регулярные лимиты'));assert.ok(!html.includes('<details open>'));assert.ok(html.includes('это не безопасная сумма для покупок'));assert.equal(h.writes(),0);
